@@ -1,3 +1,5 @@
+mod tui;
+
 use clap::{Parser, Subcommand};
 use regex::Regex;
 use serde::Deserialize;
@@ -6,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug)]
-enum BmError {
+pub enum BmError {
     NoConfig(PathBuf),
     InvalidConfig(PathBuf, String),
     FileNotFound(PathBuf),
@@ -68,6 +70,8 @@ enum Commands {
         /// 1-based index or URL to remove
         target: String,
     },
+    /// Open interactive TUI browser
+    Tui,
 }
 
 fn config_path() -> PathBuf {
@@ -98,12 +102,12 @@ fn resolve_path(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-fn read_bookmarks(path: &PathBuf) -> Vec<String> {
+pub fn read_bookmarks(path: &PathBuf) -> Vec<String> {
     let content = fs::read_to_string(path).unwrap_or_default();
     content.lines().map(String::from).collect()
 }
 
-fn bookmark_entries(lines: &[String]) -> Vec<(usize, &str)> {
+pub fn bookmark_entries(lines: &[String]) -> Vec<(usize, &str)> {
     lines
         .iter()
         .enumerate()
@@ -112,7 +116,7 @@ fn bookmark_entries(lines: &[String]) -> Vec<(usize, &str)> {
         .collect()
 }
 
-fn extract_url(line: &str) -> &str {
+pub fn extract_url(line: &str) -> &str {
     let stripped = line.strip_prefix("- ").unwrap_or(line);
     stripped.split_whitespace().next().unwrap_or(stripped)
 }
@@ -325,7 +329,7 @@ fn cmd_search(query: &str, bm_path: &PathBuf) -> String {
     output
 }
 
-fn cmd_remove(target: &str, bm_path: &PathBuf) -> Result<String, BmError> {
+pub fn cmd_remove(target: &str, bm_path: &PathBuf) -> Result<String, BmError> {
     let lines = read_bookmarks(bm_path);
     let entries = bookmark_entries(&lines);
 
@@ -378,11 +382,12 @@ fn run() -> Result<(), BmError> {
         Some(Commands::List) => println!("{}", cmd_list(&bm_path)),
         Some(Commands::Search { query }) => println!("{}", cmd_search(&query, &bm_path)),
         Some(Commands::Remove { target }) => println!("{}", cmd_remove(&target, &bm_path)?),
+        Some(Commands::Tui) => tui::run_tui(bm_path)?,
         None => {
             if let Some(url) = cli.url {
                 println!("{}", cmd_add(&url, &bm_path)?);
             } else {
-                println!("{}", cmd_list(&bm_path));
+                tui::run_tui(bm_path)?;
             }
         }
     }
