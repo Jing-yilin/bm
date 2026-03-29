@@ -147,6 +147,7 @@ dependencies = [
  "regex",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]

@@ -94,10 +94,10 @@ fn load_config_from(path: &PathBuf) -> Result<Config, BmError> {
 }
 
 fn resolve_path(p: &str) -> PathBuf {
-    if p.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&p[2..]);
-        }
+    if p.starts_with('~')
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(&p[2..]);
     }
     PathBuf::from(p)
 }
@@ -226,7 +226,154 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&mdash;", "\u{2014}")
 }
 
+fn is_private_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    let host_start = if let Some(pos) = lower.find("://") {
+        pos + 3
+    } else {
+        return true;
+    };
+    let host_part = &lower[host_start..];
+    let host_and_port = host_part.split('/').next().unwrap_or("");
+    let host = if host_and_port.starts_with('[') {
+        // IPv6 bracket notation: [::1]:port
+        host_and_port.split(']').next().map(|s| &s[1..]).unwrap_or(host_and_port)
+    } else {
+        host_and_port.split(':').next().unwrap_or(host_and_port)
+    };
+
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("172.16.")
+        || host.starts_with("172.17.")
+        || host.starts_with("172.18.")
+        || host.starts_with("172.19.")
+        || host.starts_with("172.20.")
+        || host.starts_with("172.21.")
+        || host.starts_with("172.22.")
+        || host.starts_with("172.23.")
+        || host.starts_with("172.24.")
+        || host.starts_with("172.25.")
+        || host.starts_with("172.26.")
+        || host.starts_with("172.27.")
+        || host.starts_with("172.28.")
+        || host.starts_with("172.29.")
+        || host.starts_with("172.30.")
+        || host.starts_with("172.31.")
+        || lower.starts_with("file://")
+}
+
+fn is_x_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.starts_with("https://x.com/")
+        || lower.starts_with("http://x.com/")
+        || lower.starts_with("https://twitter.com/")
+        || lower.starts_with("http://twitter.com/")
+        || lower.starts_with("https://www.x.com/")
+        || lower.starts_with("https://www.twitter.com/")
+}
+
+fn extract_first_paragraph(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("[![")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('[')
+            || trimmed.starts_with("![")
+            || trimmed.len() <= 20
+        {
+            continue;
+        }
+        let truncated = if trimmed.len() > 120 {
+            let boundary = trimmed.char_indices()
+                .take_while(|(i, _)| *i < 120)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(120);
+            format!("{}...", &trimmed[..boundary])
+        } else {
+            trimmed.to_string()
+        };
+        return Some(truncated);
+    }
+    None
+}
+
+fn clean_x_title(title: &str) -> Option<String> {
+    let t = title.trim();
+    if t.is_empty() || t == "X" || t == "Twitter" {
+        return None;
+    }
+    let t = t.strip_suffix(" / X")
+        .or_else(|| t.strip_suffix(" / Twitter"))
+        .unwrap_or(t);
+    if t.is_empty() { None } else { Some(t.to_string()) }
+}
+
+fn fetch_metadata_via_jina(url: &str) -> Option<String> {
+    if is_private_url(url) {
+        return None;
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+
+    let mut req = client
+        .post("https://r.jina.ai/")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("X-Engine", "browser")
+        .header("X-Timeout", "20")
+        .header("X-Retain-Images", "none");
+
+    if is_x_url(url) {
+        req = req.header("X-Wait-For-Selector", "[data-testid='tweetText']");
+    }
+
+    let body = serde_json::json!({"url": url});
+    let resp = req.json(&body).send().ok()?;
+    let json: serde_json::Value = resp.json().ok()?;
+    let data = json.get("data")?;
+
+    let raw_title = data.get("title").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
+    let description = data.get("description").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
+    let content = data.get("content").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
+
+    let title = if is_x_url(url) {
+        clean_x_title(raw_title)
+    } else {
+        let t = raw_title.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    };
+
+    let desc = if description.trim().is_empty() {
+        None
+    } else {
+        Some(description.trim().to_string())
+    };
+
+    let label = format_bookmark_label(title.clone(), desc);
+    if label.is_some() {
+        return label;
+    }
+
+    extract_first_paragraph(content)
+}
+
 fn fetch_metadata(url: &str) -> Option<String> {
+    if is_x_url(url) {
+        return fetch_metadata_via_jina(url);
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -244,7 +391,13 @@ fn fetch_metadata(url: &str) -> Option<String> {
 
     let body = resp.text().ok()?;
     let meta = extract_metadata_from_html(&body);
-    format_bookmark_label(meta.title, meta.description)
+    let label = format_bookmark_label(meta.title, meta.description);
+    if label.is_some() {
+        return label;
+    }
+
+    // Fallback to Jina Reader for JS-heavy sites
+    fetch_metadata_via_jina(url)
 }
 
 fn is_duplicate(url: &str, bm_path: &PathBuf) -> bool {
@@ -898,6 +1051,235 @@ mod tests {
 
         let e = BmError::BookmarkNotFound("https://x.com".into());
         assert_eq!(format!("{}", e), "Bookmark not found: https://x.com");
+    }
+
+    // -- is_private_url --
+
+    #[test]
+    fn test_is_private_url_localhost() {
+        assert!(is_private_url("http://localhost:3000/api"));
+        assert!(is_private_url("https://localhost/path"));
+        assert!(is_private_url("http://127.0.0.1:8080/test"));
+        assert!(is_private_url("http://[::1]:9000/"));
+        assert!(is_private_url("http://0.0.0.0/"));
+    }
+
+    #[test]
+    fn test_is_private_url_private_networks() {
+        assert!(is_private_url("http://10.0.0.1/admin"));
+        assert!(is_private_url("http://192.168.1.1/"));
+        assert!(is_private_url("http://172.16.0.1/internal"));
+        assert!(is_private_url("http://172.31.255.255/"));
+    }
+
+    #[test]
+    fn test_is_private_url_local_domains() {
+        assert!(is_private_url("http://myserver.local/api"));
+        assert!(is_private_url("https://app.internal/dashboard"));
+    }
+
+    #[test]
+    fn test_is_private_url_file_scheme() {
+        assert!(is_private_url("file:///home/user/doc.html"));
+    }
+
+    #[test]
+    fn test_is_private_url_no_scheme() {
+        assert!(is_private_url("just-a-string"));
+    }
+
+    #[test]
+    fn test_is_private_url_public() {
+        assert!(!is_private_url("https://example.com"));
+        assert!(!is_private_url("https://github.com/user/repo"));
+        assert!(!is_private_url("https://x.com/user/status/123"));
+        assert!(!is_private_url("http://172.15.0.1/not-private"));
+        assert!(!is_private_url("http://172.32.0.1/not-private"));
+    }
+
+    // -- is_x_url --
+
+    #[test]
+    fn test_is_x_url_https() {
+        assert!(is_x_url("https://x.com/user/status/123"));
+        assert!(is_x_url("https://twitter.com/user/status/123"));
+    }
+
+    #[test]
+    fn test_is_x_url_www() {
+        assert!(is_x_url("https://www.x.com/user/status/123"));
+        assert!(is_x_url("https://www.twitter.com/user/status/123"));
+    }
+
+    #[test]
+    fn test_is_x_url_http() {
+        assert!(is_x_url("http://x.com/user/status/123"));
+        assert!(is_x_url("http://twitter.com/user/status/123"));
+    }
+
+    #[test]
+    fn test_is_x_url_false() {
+        assert!(!is_x_url("https://example.com"));
+        assert!(!is_x_url("https://github.com"));
+        assert!(!is_x_url("https://notx.com/path"));
+        assert!(!is_x_url("https://xtwitter.com/path"));
+    }
+
+    // -- clean_x_title --
+
+    #[test]
+    fn test_clean_x_title_with_suffix() {
+        assert_eq!(
+            clean_x_title("YQ on X: \"Agents Don't Click Ads.\" / X"),
+            Some("YQ on X: \"Agents Don't Click Ads.\"".into())
+        );
+    }
+
+    #[test]
+    fn test_clean_x_title_twitter_suffix() {
+        assert_eq!(
+            clean_x_title("User on X: \"Hello\" / Twitter"),
+            Some("User on X: \"Hello\"".into())
+        );
+    }
+
+    #[test]
+    fn test_clean_x_title_generic() {
+        assert_eq!(clean_x_title("X"), None);
+        assert_eq!(clean_x_title("Twitter"), None);
+        assert_eq!(clean_x_title(""), None);
+    }
+
+    // -- extract_first_paragraph --
+
+    #[test]
+    fn test_extract_first_paragraph_skips_images() {
+        let content = "[![Image 1](https://img.png)](https://link)\n\nThe quick brown fox jumps over the lazy dog.";
+        assert_eq!(
+            extract_first_paragraph(content),
+            Some("The quick brown fox jumps over the lazy dog.".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_skips_headers() {
+        let content = "# Title\n\n## Subtitle\n\nThis is the first real paragraph of content here.";
+        assert_eq!(
+            extract_first_paragraph(content),
+            Some("This is the first real paragraph of content here.".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_truncates() {
+        let long = "A".repeat(200);
+        let result = extract_first_paragraph(&long).unwrap();
+        assert!(result.len() < 130);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_empty() {
+        assert_eq!(extract_first_paragraph(""), None);
+        assert_eq!(extract_first_paragraph("# Only header"), None);
+    }
+
+    #[test]
+    fn test_is_x_url_case_insensitive() {
+        assert!(is_x_url("https://X.COM/user/status/123"));
+        assert!(is_x_url("HTTPS://x.com/user/status/123"));
+        assert!(is_x_url("https://Twitter.com/user/status/456"));
+    }
+
+    #[test]
+    fn test_is_x_url_article_path() {
+        assert!(is_x_url("https://x.com/yq_acc/article/2037579506429657198"));
+    }
+
+    #[test]
+    fn test_is_x_url_edge_cases() {
+        assert!(!is_x_url("https://x.com"));
+        assert!(!is_x_url(""));
+        assert!(!is_x_url("x.com/user/status/123"));
+    }
+
+    #[test]
+    fn test_clean_x_title_no_suffix() {
+        assert_eq!(
+            clean_x_title("YQ on X: \"Some text\""),
+            Some("YQ on X: \"Some text\"".into())
+        );
+    }
+
+    #[test]
+    fn test_clean_x_title_whitespace() {
+        assert_eq!(
+            clean_x_title("  User on X: \"Hello\" / X  "),
+            Some("User on X: \"Hello\"".into())
+        );
+        assert_eq!(clean_x_title("   "), None);
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_skips_links() {
+        let content = "[Log in](https://x.com/login)\n[Sign up](https://x.com/signup)\n\nThis is meaningful text after some links.";
+        assert_eq!(
+            extract_first_paragraph(content),
+            Some("This is meaningful text after some links.".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_skips_inline_images() {
+        let content = "![Image 1: alt text](https://img.png)\n\nThe actual paragraph starts here with real text.";
+        assert_eq!(
+            extract_first_paragraph(content),
+            Some("The actual paragraph starts here with real text.".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_skips_short_lines() {
+        let content = "OK\nNot enough\nShort line here!!!\n\nThis line is long enough to be a real paragraph for the reader.";
+        assert_eq!(
+            extract_first_paragraph(content),
+            Some("This line is long enough to be a real paragraph for the reader.".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_unicode_truncation() {
+        let content = "这是一段很长的中文内容，用来测试Unicode字符的截断功能。我们需要确保截断不会发生在多字节字符的中间位置，否则会导致无效的UTF-8字符串。这段文字应该足够长以触发截断逻辑。";
+        let result = extract_first_paragraph(content).unwrap();
+        assert!(result.ends_with("..."));
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_trims_whitespace() {
+        let content = "   \n   \n   The first real paragraph with leading spaces.   ";
+        assert_eq!(
+            extract_first_paragraph(content),
+            Some("The first real paragraph with leading spaces.".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_realistic_jina_x_output() {
+        let content = r#"[![Image 1: Image](https://pbs.twimg.com/media/abc.jpg)](https://x.com/user/article/123/media/456)
+
+The internet's business model is advertising. For thirty years, that has been the default: show humans content, harvest attention, convert clicks into revenue.
+
+AI agents break this model. An agent calling an API does not have attention to harvest."#;
+        let result = extract_first_paragraph(content).unwrap();
+        assert!(result.starts_with("The internet's business model is advertising."));
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_first_paragraph_only_non_text() {
+        let content = "# Header\n## Subheader\n[![img](url)](link)\n![alt](url)\n[link](url)\nshort";
+        assert_eq!(extract_first_paragraph(content), None);
     }
 
     // -- integration: add then remove preserves file --
