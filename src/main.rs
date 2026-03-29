@@ -1,9 +1,38 @@
 use clap::{Parser, Subcommand};
 use regex::Regex;
 use serde::Deserialize;
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
-use std::process;
+
+#[derive(Debug)]
+enum BmError {
+    NoConfig(PathBuf),
+    InvalidConfig(PathBuf, String),
+    FileNotFound(PathBuf),
+    IoError(String),
+    IndexOutOfRange(usize, usize),
+    BookmarkNotFound(String),
+}
+
+impl fmt::Display for BmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BmError::NoConfig(p) => write!(
+                f,
+                "No config found. Create {} with:\n\n  bookmarks_file = \"/path/to/bookmarks.md\"\n",
+                p.display()
+            ),
+            BmError::InvalidConfig(p, e) => write!(f, "Invalid config {}: {}", p.display(), e),
+            BmError::FileNotFound(p) => write!(f, "Bookmarks file not found: {}", p.display()),
+            BmError::IoError(e) => write!(f, "{}", e),
+            BmError::IndexOutOfRange(idx, max) => {
+                write!(f, "Index {} out of range (1-{}).", idx, max)
+            }
+            BmError::BookmarkNotFound(t) => write!(f, "Bookmark not found: {}", t),
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct Config {
@@ -49,20 +78,14 @@ fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
-fn load_config() -> Config {
-    let path = config_path();
+fn load_config_from(path: &PathBuf) -> Result<Config, BmError> {
     if path.exists() {
-        let content = fs::read_to_string(&path).unwrap_or_default();
-        toml::from_str(&content).unwrap_or_else(|e| {
-            eprintln!("Invalid config {}: {}", path.display(), e);
-            process::exit(1);
-        })
+        let content = fs::read_to_string(path)
+            .map_err(|e| BmError::IoError(format!("Failed to read {}: {}", path.display(), e)))?;
+        toml::from_str(&content)
+            .map_err(|e| BmError::InvalidConfig(path.clone(), e.to_string()))
     } else {
-        eprintln!(
-            "No config found. Create {} with:\n\n  bookmarks_file = \"/path/to/bookmarks.md\"\n",
-            path.display()
-        );
-        process::exit(1);
+        Err(BmError::NoConfig(path.clone()))
     }
 }
 
@@ -94,6 +117,25 @@ fn extract_url(line: &str) -> &str {
     stripped.split_whitespace().next().unwrap_or(stripped)
 }
 
+fn extract_title_from_html(html: &str) -> Option<String> {
+    let re = Regex::new(r"(?i)<title[^>]*>([\s\S]*?)</title>").ok()?;
+    let caps = re.captures(html)?;
+    let title = caps.get(1)?.as_str().trim().to_string();
+    let title = decode_html_entities(&title);
+    if title.is_empty() { None } else { Some(title) }
+}
+
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&ndash;", "\u{2013}")
+        .replace("&mdash;", "\u{2014}")
+}
+
 fn fetch_title(url: &str) -> Option<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -103,120 +145,117 @@ fn fetch_title(url: &str) -> Option<String> {
 
     let resp = client
         .get(url)
-        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) bm/0.1")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) bm/0.1",
+        )
         .send()
         .ok()?;
 
     let body = resp.text().ok()?;
-    let re = Regex::new(r"(?i)<title[^>]*>([\s\S]*?)</title>").ok()?;
-    let caps = re.captures(&body)?;
-    let title = caps.get(1)?.as_str().trim().to_string();
-    let title = title
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&#39;", "'")
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'")
-        .replace("&ndash;", "\u{2013}")
-        .replace("&mdash;", "\u{2014}");
-
-    if title.is_empty() { None } else { Some(title) }
+    extract_title_from_html(&body)
 }
 
-fn cmd_add(url: &str, bm_path: &PathBuf) {
+fn is_duplicate(url: &str, bm_path: &PathBuf) -> bool {
     let lines = read_bookmarks(bm_path);
     let entries = bookmark_entries(&lines);
-    for (_, line) in &entries {
-        if extract_url(line) == url {
-            println!("Already bookmarked: {}", url);
-            return;
-        }
-    }
+    entries.iter().any(|(_, line)| extract_url(line) == url)
+}
 
-    print!("Fetching title... ");
-    let entry = match fetch_title(url) {
-        Some(title) => {
-            println!("{}", title);
-            format!("- {} - {}", url, title)
-        }
-        None => {
-            println!("(not found)");
-            format!("- {}", url)
-        }
-    };
-
-    let mut content = fs::read_to_string(bm_path).unwrap_or_default();
+fn append_entry(entry: &str, bm_path: &PathBuf) -> Result<(), BmError> {
+    let mut content = fs::read_to_string(bm_path)
+        .map_err(|e| BmError::IoError(format!("Failed to read {}: {}", bm_path.display(), e)))?;
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(&entry);
+    content.push_str(entry);
     content.push('\n');
-    fs::write(bm_path, content).unwrap_or_else(|e| {
-        eprintln!("Failed to write {}: {}", bm_path.display(), e);
-        process::exit(1);
-    });
-
-    println!("Bookmarked: {}", entry.strip_prefix("- ").unwrap_or(&entry));
+    fs::write(bm_path, content)
+        .map_err(|e| BmError::IoError(format!("Failed to write {}: {}", bm_path.display(), e)))
 }
 
-fn cmd_list(bm_path: &PathBuf) {
+fn cmd_add(url: &str, bm_path: &PathBuf) -> Result<String, BmError> {
+    if is_duplicate(url, bm_path) {
+        return Ok(format!("Already bookmarked: {}", url));
+    }
+
+    print!("Fetching title... ");
+    let title = fetch_title(url);
+    match &title {
+        Some(t) => println!("{}", t),
+        None => println!("(not found)"),
+    }
+
+    add_entry(url, title, bm_path)
+}
+
+fn add_entry(url: &str, title: Option<String>, bm_path: &PathBuf) -> Result<String, BmError> {
+    let entry = match title {
+        Some(t) => format!("- {} - {}", url, t),
+        None => format!("- {}", url),
+    };
+
+    append_entry(&entry, bm_path)?;
+    Ok(format!(
+        "Bookmarked: {}",
+        entry.strip_prefix("- ").unwrap_or(&entry)
+    ))
+}
+
+fn cmd_list(bm_path: &PathBuf) -> String {
     let lines = read_bookmarks(bm_path);
     let entries = bookmark_entries(&lines);
     if entries.is_empty() {
-        println!("No bookmarks found.");
-        return;
+        return "No bookmarks found.".to_string();
     }
+    let mut output = String::new();
     for (idx, (_, line)) in entries.iter().enumerate() {
         let content = line.strip_prefix("- ").unwrap_or(line);
-        println!("  {}. {}", idx + 1, content);
+        output.push_str(&format!("  {}. {}\n", idx + 1, content));
     }
-    println!("\n{} bookmark(s)", entries.len());
+    output.push_str(&format!("\n{} bookmark(s)", entries.len()));
+    output
 }
 
-fn cmd_search(query: &str, bm_path: &PathBuf) {
+fn cmd_search(query: &str, bm_path: &PathBuf) -> String {
     let lines = read_bookmarks(bm_path);
     let entries = bookmark_entries(&lines);
     let q = query.to_lowercase();
     let matches: Vec<_> = entries
         .iter()
-        .enumerate()
-        .filter(|(_, (_, line))| line.to_lowercase().contains(&q))
+        .filter(|(_, line)| line.to_lowercase().contains(&q))
         .collect();
 
     if matches.is_empty() {
-        println!("No bookmarks matching \"{}\".", query);
-        return;
+        return format!("No bookmarks matching \"{}\".", query);
     }
-    for (_, (_, line)) in &matches {
+    let mut output = String::new();
+    for (_, line) in &matches {
         let content = line.strip_prefix("- ").unwrap_or(line);
-        println!("  {}", content);
+        output.push_str(&format!("  {}\n", content));
     }
-    println!("\n{} result(s)", matches.len());
+    output.push_str(&format!("\n{} result(s)", matches.len()));
+    output
 }
 
-fn cmd_remove(target: &str, bm_path: &PathBuf) {
+fn cmd_remove(target: &str, bm_path: &PathBuf) -> Result<String, BmError> {
     let lines = read_bookmarks(bm_path);
     let entries = bookmark_entries(&lines);
 
     let remove_line_idx = if let Ok(idx) = target.parse::<usize>() {
         if idx == 0 || idx > entries.len() {
-            eprintln!("Index {} out of range (1-{}).", idx, entries.len());
-            process::exit(1);
+            return Err(BmError::IndexOutOfRange(idx, entries.len()));
         }
         entries[idx - 1].0
     } else {
         match entries.iter().find(|(_, line)| extract_url(line) == target) {
             Some((line_idx, _)) => *line_idx,
-            None => {
-                eprintln!("Bookmark not found: {}", target);
-                process::exit(1);
-            }
+            None => return Err(BmError::BookmarkNotFound(target.to_string())),
         }
     };
 
     let removed = &lines[remove_line_idx];
-    println!(
+    let msg = format!(
         "Removed: {}",
         removed.strip_prefix("- ").unwrap_or(removed)
     );
@@ -232,33 +271,416 @@ fn cmd_remove(target: &str, bm_path: &PathBuf) {
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    fs::write(bm_path, content).unwrap_or_else(|e| {
-        eprintln!("Failed to write {}: {}", bm_path.display(), e);
-        process::exit(1);
-    });
+    fs::write(bm_path, content)
+        .map_err(|e| BmError::IoError(format!("Failed to write {}: {}", bm_path.display(), e)))?;
+
+    Ok(msg)
 }
 
-fn main() {
+fn run() -> Result<(), BmError> {
     let cli = Cli::parse();
-    let config = load_config();
+    let config = load_config_from(&config_path())?;
     let bm_path = resolve_path(&config.bookmarks_file);
 
     if !bm_path.exists() {
-        eprintln!("Bookmarks file not found: {}", bm_path.display());
-        process::exit(1);
+        return Err(BmError::FileNotFound(bm_path));
     }
 
     match cli.command {
-        Some(Commands::Add { url }) => cmd_add(&url, &bm_path),
-        Some(Commands::List) => cmd_list(&bm_path),
-        Some(Commands::Search { query }) => cmd_search(&query, &bm_path),
-        Some(Commands::Remove { target }) => cmd_remove(&target, &bm_path),
+        Some(Commands::Add { url }) => println!("{}", cmd_add(&url, &bm_path)?),
+        Some(Commands::List) => println!("{}", cmd_list(&bm_path)),
+        Some(Commands::Search { query }) => println!("{}", cmd_search(&query, &bm_path)),
+        Some(Commands::Remove { target }) => println!("{}", cmd_remove(&target, &bm_path)?),
         None => {
             if let Some(url) = cli.url {
-                cmd_add(&url, &bm_path);
+                println!("{}", cmd_add(&url, &bm_path)?);
             } else {
-                cmd_list(&bm_path);
+                println!("{}", cmd_list(&bm_path));
             }
         }
+    }
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn create_temp_bookmarks(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bookmarks.md");
+        fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    const SAMPLE: &str = "\
+# Saved URLs
+
+- https://example.com - Example Domain
+- https://rust-lang.org - Rust Programming Language
+- https://github.com - GitHub
+";
+
+    // -- extract_url --
+
+    #[test]
+    fn test_extract_url_with_title() {
+        assert_eq!(
+            extract_url("- https://example.com - Example"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_url_bare() {
+        assert_eq!(extract_url("- https://bare.com"), "https://bare.com");
+    }
+
+    #[test]
+    fn test_extract_url_no_prefix() {
+        assert_eq!(
+            extract_url("https://no-prefix.com - Title"),
+            "https://no-prefix.com"
+        );
+    }
+
+    // -- extract_title_from_html --
+
+    #[test]
+    fn test_extract_title_basic() {
+        let html = "<html><head><title>Hello World</title></head></html>";
+        assert_eq!(extract_title_from_html(html), Some("Hello World".into()));
+    }
+
+    #[test]
+    fn test_extract_title_with_entities() {
+        let html = "<title>Foo &amp; Bar &ndash; Baz</title>";
+        assert_eq!(
+            extract_title_from_html(html),
+            Some("Foo & Bar \u{2013} Baz".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_title_multiline() {
+        let html = "<title>\n  Multi\n  Line\n</title>";
+        assert_eq!(extract_title_from_html(html), Some("Multi\n  Line".into()));
+    }
+
+    #[test]
+    fn test_extract_title_empty() {
+        let html = "<title>  </title>";
+        assert_eq!(extract_title_from_html(html), None);
+    }
+
+    #[test]
+    fn test_extract_title_missing() {
+        let html = "<html><body>No title here</body></html>";
+        assert_eq!(extract_title_from_html(html), None);
+    }
+
+    #[test]
+    fn test_extract_title_case_insensitive() {
+        let html = "<TITLE>Upper Case</TITLE>";
+        assert_eq!(
+            extract_title_from_html(html),
+            Some("Upper Case".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_title_with_attributes() {
+        let html = "<title lang=\"en\">With Attrs</title>";
+        assert_eq!(
+            extract_title_from_html(html),
+            Some("With Attrs".into())
+        );
+    }
+
+    // -- decode_html_entities --
+
+    #[test]
+    fn test_decode_all_entities() {
+        let s = "&amp; &lt; &gt; &#39; &quot; &#x27; &ndash; &mdash;";
+        assert_eq!(
+            decode_html_entities(s),
+            "& < > ' \" ' \u{2013} \u{2014}"
+        );
+    }
+
+    // -- bookmark_entries --
+
+    #[test]
+    fn test_bookmark_entries_filters_header() {
+        let lines: Vec<String> = SAMPLE.lines().map(String::from).collect();
+        let entries = bookmark_entries(&lines);
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].1.starts_with("- https://example.com"));
+    }
+
+    #[test]
+    fn test_bookmark_entries_empty() {
+        let lines: Vec<String> = vec!["# Header".into(), "".into()];
+        assert_eq!(bookmark_entries(&lines).len(), 0);
+    }
+
+    // -- resolve_path --
+
+    #[test]
+    fn test_resolve_path_absolute() {
+        let p = resolve_path("/tmp/bookmarks.md");
+        assert_eq!(p, PathBuf::from("/tmp/bookmarks.md"));
+    }
+
+    #[test]
+    fn test_resolve_path_tilde() {
+        let p = resolve_path("~/test.md");
+        assert!(p.to_string_lossy().contains("test.md"));
+        assert!(!p.to_string_lossy().starts_with("~"));
+    }
+
+    // -- is_duplicate --
+
+    #[test]
+    fn test_is_duplicate_true() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        assert!(is_duplicate("https://example.com", &path));
+    }
+
+    #[test]
+    fn test_is_duplicate_false() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        assert!(!is_duplicate("https://new-site.com", &path));
+    }
+
+    // -- add_entry (testable version without network) --
+
+    #[test]
+    fn test_add_new_bookmark_with_title() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = add_entry("https://new.com", Some("New Site".into()), &path).unwrap();
+        assert!(result.contains("Bookmarked:"));
+        assert!(result.contains("https://new.com"));
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("- https://new.com - New Site"));
+    }
+
+    #[test]
+    fn test_add_new_bookmark_no_title() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = add_entry("https://notitle.com", None, &path).unwrap();
+        assert!(result.contains("Bookmarked:"));
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("- https://notitle.com\n"));
+    }
+
+    #[test]
+    fn test_add_duplicate_detected() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        assert!(is_duplicate("https://example.com", &path));
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("https://example.com").count(), 1);
+    }
+
+    #[test]
+    fn test_add_entry_does_not_dedup() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = add_entry("https://example.com", Some("Dup".into()), &path).unwrap();
+        assert!(result.contains("Bookmarked:"));
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("https://example.com").count(), 2);
+    }
+
+    // -- cmd_list --
+
+    #[test]
+    fn test_list_shows_all() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let output = cmd_list(&path);
+        assert!(output.contains("1. https://example.com"));
+        assert!(output.contains("2. https://rust-lang.org"));
+        assert!(output.contains("3. https://github.com"));
+        assert!(output.contains("3 bookmark(s)"));
+    }
+
+    #[test]
+    fn test_list_empty() {
+        let (_dir, path) = create_temp_bookmarks("# Saved URLs\n");
+        let output = cmd_list(&path);
+        assert_eq!(output, "No bookmarks found.");
+    }
+
+    // -- cmd_search --
+
+    #[test]
+    fn test_search_found() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let output = cmd_search("rust", &path);
+        assert!(output.contains("https://rust-lang.org"));
+        assert!(output.contains("1 result(s)"));
+    }
+
+    #[test]
+    fn test_search_case_insensitive() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let output = cmd_search("GITHUB", &path);
+        assert!(output.contains("https://github.com"));
+    }
+
+    #[test]
+    fn test_search_multiple_results() {
+        let content = "\
+# Saved URLs
+
+- https://a.com - Rust Book
+- https://b.com - Rust By Example
+- https://c.com - Python Docs
+";
+        let (_dir, path) = create_temp_bookmarks(content);
+        let output = cmd_search("rust", &path);
+        assert!(output.contains("2 result(s)"));
+    }
+
+    #[test]
+    fn test_search_no_match() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let output = cmd_search("xyznonexistent", &path);
+        assert!(output.contains("No bookmarks matching"));
+    }
+
+    // -- cmd_remove --
+
+    #[test]
+    fn test_remove_by_index() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = cmd_remove("2", &path).unwrap();
+        assert!(result.contains("Removed:"));
+        assert!(result.contains("rust-lang.org"));
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("rust-lang.org"));
+        assert!(content.contains("example.com"));
+        assert!(content.contains("github.com"));
+    }
+
+    #[test]
+    fn test_remove_by_url() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = cmd_remove("https://github.com", &path).unwrap();
+        assert!(result.contains("Removed:"));
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("github.com"));
+    }
+
+    #[test]
+    fn test_remove_first_entry() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = cmd_remove("1", &path).unwrap();
+        assert!(result.contains("example.com"));
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("example.com"));
+        assert!(content.contains("rust-lang.org"));
+    }
+
+    #[test]
+    fn test_remove_last_entry() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = cmd_remove("3", &path).unwrap();
+        assert!(result.contains("github.com"));
+    }
+
+    #[test]
+    fn test_remove_index_zero() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = cmd_remove("0", &path);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BmError::IndexOutOfRange(0, 3) => {}
+            other => panic!("Expected IndexOutOfRange(0, 3), got: {}", other),
+        }
+    }
+
+    #[test]
+    fn test_remove_index_too_large() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = cmd_remove("99", &path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_url_not_found() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let result = cmd_remove("https://nothere.com", &path);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BmError::BookmarkNotFound(u) => assert_eq!(u, "https://nothere.com"),
+            other => panic!("Expected BookmarkNotFound, got: {}", other),
+        }
+    }
+
+    // -- load_config_from --
+
+    #[test]
+    fn test_load_config_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "bookmarks_file = \"/tmp/bm.md\"\n").unwrap();
+        let cfg = load_config_from(&path).unwrap();
+        assert_eq!(cfg.bookmarks_file, "/tmp/bm.md");
+    }
+
+    #[test]
+    fn test_load_config_missing() {
+        let path = PathBuf::from("/nonexistent/config.toml");
+        let result = load_config_from(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_config_invalid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "not valid toml [[[").unwrap();
+        let result = load_config_from(&path);
+        assert!(result.is_err());
+    }
+
+    // -- BmError Display --
+
+    #[test]
+    fn test_error_display() {
+        let e = BmError::IndexOutOfRange(5, 3);
+        assert_eq!(format!("{}", e), "Index 5 out of range (1-3).");
+
+        let e = BmError::BookmarkNotFound("https://x.com".into());
+        assert_eq!(format!("{}", e), "Bookmark not found: https://x.com");
+    }
+
+    // -- integration: add then remove preserves file --
+
+    #[test]
+    fn test_add_then_remove_roundtrip() {
+        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let original = fs::read_to_string(&path).unwrap();
+        let original_count = original.matches("- https://").count();
+
+        add_entry("https://temp.com", Some("Temp".into()), &path).unwrap();
+        let after_add = fs::read_to_string(&path).unwrap();
+        assert_eq!(after_add.matches("- https://").count(), original_count + 1);
+
+        cmd_remove("https://temp.com", &path).unwrap();
+        let after_remove = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after_remove.matches("- https://").count(),
+            original_count
+        );
+        assert!(!after_remove.contains("temp.com"));
     }
 }
