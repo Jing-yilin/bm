@@ -1,0 +1,17 @@
+[package]
+name = "bm"
+version = "0.1.0"
+edition = "2024"
+description = "CLI bookmark manager backed by a markdown file"
+
+[[bin]]
+name = "bm"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
