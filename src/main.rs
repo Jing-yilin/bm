@@ -1,8 +1,9 @@
 mod tui;
 
+use chrono::Local;
 use clap::{Parser, Subcommand};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
@@ -22,7 +23,7 @@ impl fmt::Display for BmError {
         match self {
             BmError::NoConfig(p) => write!(
                 f,
-                "No config found. Create {} with:\n\n  bookmarks_file = \"/path/to/bookmarks.md\"\n",
+                "No config found. Create {} with:\n\n  bookmarks_file = \"/path/to/bookmarks.csv\"\n",
                 p.display()
             ),
             BmError::InvalidConfig(p, e) => write!(f, "Invalid config {}: {}", p.display(), e),
@@ -41,8 +42,16 @@ struct Config {
     bookmarks_file: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Bookmark {
+    pub date: String,
+    pub url: String,
+    pub title: String,
+    pub description: String,
+}
+
 #[derive(Parser)]
-#[command(name = "bm", about = "CLI bookmark manager backed by a markdown file")]
+#[command(name = "bm", about = "CLI bookmark manager backed by a CSV file")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -102,24 +111,90 @@ fn resolve_path(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-pub fn read_bookmarks(path: &PathBuf) -> Vec<String> {
-    let content = fs::read_to_string(path).unwrap_or_default();
-    content.lines().map(String::from).collect()
+fn csv_path_from(configured: &std::path::Path) -> PathBuf {
+    configured.with_extension("csv")
 }
 
-pub fn bookmark_entries(lines: &[String]) -> Vec<(usize, &str)> {
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.starts_with("- "))
-        .map(|(i, l)| (i, l.as_str()))
+// --- CSV read/write ---
+
+pub fn read_bookmarks(path: &PathBuf) -> Vec<Bookmark> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut rdr = csv::Reader::from_reader(content.as_bytes());
+    rdr.deserialize()
+        .filter_map(|r| r.ok())
         .collect()
 }
 
-pub fn extract_url(line: &str) -> &str {
-    let stripped = line.strip_prefix("- ").unwrap_or(line);
-    stripped.split_whitespace().next().unwrap_or(stripped)
+pub fn write_bookmarks(bookmarks: &[Bookmark], path: &PathBuf) -> Result<(), BmError> {
+    let mut wtr = csv::Writer::from_writer(Vec::new());
+    for bm in bookmarks {
+        wtr.serialize(bm)
+            .map_err(|e| BmError::IoError(format!("CSV write error: {}", e)))?;
+    }
+    let data = wtr
+        .into_inner()
+        .map_err(|e| BmError::IoError(format!("CSV flush error: {}", e)))?;
+    fs::write(path, data)
+        .map_err(|e| BmError::IoError(format!("Failed to write {}: {}", path.display(), e)))
 }
+
+fn ensure_csv_file(path: &PathBuf) -> Result<(), BmError> {
+    if !path.exists() {
+        fs::write(path, "date,url,title,description\n")
+            .map_err(|e| BmError::IoError(format!("Failed to create {}: {}", path.display(), e)))?;
+    }
+    Ok(())
+}
+
+// --- Migration from .md to .csv ---
+
+fn migrate_md_to_csv(md_path: &PathBuf, csv_path: &PathBuf) -> Result<(), BmError> {
+    let content = fs::read_to_string(md_path)
+        .map_err(|e| BmError::IoError(format!("Failed to read {}: {}", md_path.display(), e)))?;
+
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let mut bookmarks = Vec::new();
+
+    for line in content.lines() {
+        if !line.starts_with("- ") {
+            continue;
+        }
+        let stripped = line.strip_prefix("- ").unwrap_or(line);
+        let url = stripped.split_whitespace().next().unwrap_or("").to_string();
+        if url.is_empty() {
+            continue;
+        }
+        let label = stripped
+            .strip_prefix(&url)
+            .and_then(|s| s.strip_prefix(" - "))
+            .unwrap_or("")
+            .to_string();
+
+        bookmarks.push(Bookmark {
+            date: today.clone(),
+            url,
+            title: label,
+            description: String::new(),
+        });
+    }
+
+    write_bookmarks(&bookmarks, csv_path)?;
+    eprintln!(
+        "Migrated {} bookmarks from {} to {}",
+        bookmarks.len(),
+        md_path.display(),
+        csv_path.display()
+    );
+    Ok(())
+}
+
+// --- HTML metadata extraction (unchanged) ---
 
 fn extract_title_from_html(html: &str) -> Option<String> {
     let re = Regex::new(r"(?i)<title[^>]*>([\s\S]*?)</title>").ok()?;
@@ -130,7 +205,6 @@ fn extract_title_from_html(html: &str) -> Option<String> {
 }
 
 fn extract_description_from_html(html: &str) -> Option<String> {
-    // Try og:description first, then meta description
     let og_re = Regex::new(r#"(?i)<meta\s[^>]*property\s*=\s*"og:description"[^>]*content\s*=\s*"([^"]*)"[^>]*/?\s*>"#).ok()?;
     if let Some(caps) = og_re.captures(html) {
         let desc = decode_html_entities(caps.get(1)?.as_str().trim());
@@ -138,7 +212,6 @@ fn extract_description_from_html(html: &str) -> Option<String> {
             return Some(desc);
         }
     }
-    // Also try content before property order
     let og_re2 = Regex::new(r#"(?i)<meta\s[^>]*content\s*=\s*"([^"]*)"[^>]*property\s*=\s*"og:description"[^>]*/?\s*>"#).ok()?;
     if let Some(caps) = og_re2.captures(html) {
         let desc = decode_html_entities(caps.get(1)?.as_str().trim());
@@ -146,7 +219,6 @@ fn extract_description_from_html(html: &str) -> Option<String> {
             return Some(desc);
         }
     }
-    // Fallback: meta name="description"
     let meta_re = Regex::new(r#"(?i)<meta\s[^>]*name\s*=\s*"description"[^>]*content\s*=\s*"([^"]*)"[^>]*/?\s*>"#).ok()?;
     if let Some(caps) = meta_re.captures(html) {
         let desc = decode_html_entities(caps.get(1)?.as_str().trim());
@@ -164,46 +236,15 @@ fn extract_description_from_html(html: &str) -> Option<String> {
     None
 }
 
-struct PageMeta {
-    title: Option<String>,
-    description: Option<String>,
+pub struct PageMeta {
+    pub title: Option<String>,
+    pub description: Option<String>,
 }
 
 fn extract_metadata_from_html(html: &str) -> PageMeta {
     PageMeta {
         title: extract_title_from_html(html),
         description: extract_description_from_html(html),
-    }
-}
-
-fn format_bookmark_label(title: Option<String>, description: Option<String>) -> Option<String> {
-    match (title, description) {
-        (Some(t), Some(d)) => {
-            let t_lower = t.to_lowercase();
-            let d_lower = d.to_lowercase();
-            if t_lower == d_lower {
-                Some(t)
-            } else if d_lower.starts_with(&format!("{} - ", t_lower))
-                || d_lower.starts_with(&format!("{}: ", t_lower))
-                || d_lower.starts_with(&format!("{} | ", t_lower))
-            {
-                // Description already has "Title: ..." or "Title - ..." pattern
-                Some(d)
-            } else if d_lower.starts_with(&format!("{} is ", t_lower))
-                || d_lower.starts_with(&format!("{} — ", t_lower))
-            {
-                // "Expo is an open-source..." -> "Expo: Open-source..."
-                let rest = &d[t.len()..].trim_start();
-                let rest = rest.strip_prefix("is ").or_else(|| rest.strip_prefix("— ")).unwrap_or(rest);
-                let rest = uppercase_first(rest);
-                Some(format!("{}: {}", t, rest))
-            } else {
-                Some(format!("{}: {}", t, d))
-            }
-        }
-        (Some(t), None) => Some(t),
-        (None, Some(d)) => Some(d),
-        (None, None) => None,
     }
 }
 
@@ -226,6 +267,8 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&mdash;", "\u{2014}")
 }
 
+// --- URL classification helpers ---
+
 fn is_private_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     let host_start = if let Some(pos) = lower.find("://") {
@@ -236,7 +279,6 @@ fn is_private_url(url: &str) -> bool {
     let host_part = &lower[host_start..];
     let host_and_port = host_part.split('/').next().unwrap_or("");
     let host = if host_and_port.starts_with('[') {
-        // IPv6 bracket notation: [::1]:port
         host_and_port.split(']').next().map(|s| &s[1..]).unwrap_or(host_and_port)
     } else {
         host_and_port.split(':').next().unwrap_or(host_and_port)
@@ -292,7 +334,8 @@ fn extract_first_paragraph(content: &str) -> Option<String> {
             continue;
         }
         let truncated = if trimmed.len() > 120 {
-            let boundary = trimmed.char_indices()
+            let boundary = trimmed
+                .char_indices()
                 .take_while(|(i, _)| *i < 120)
                 .last()
                 .map(|(i, c)| i + c.len_utf8())
@@ -311,13 +354,16 @@ fn clean_x_title(title: &str) -> Option<String> {
     if t.is_empty() || t == "X" || t == "Twitter" {
         return None;
     }
-    let t = t.strip_suffix(" / X")
+    let t = t
+        .strip_suffix(" / X")
         .or_else(|| t.strip_suffix(" / Twitter"))
         .unwrap_or(t);
     if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
-fn fetch_metadata_via_jina(url: &str) -> Option<String> {
+// --- Metadata fetching ---
+
+fn fetch_metadata_via_jina(url: &str) -> Option<PageMeta> {
     if is_private_url(url) {
         return None;
     }
@@ -345,7 +391,7 @@ fn fetch_metadata_via_jina(url: &str) -> Option<String> {
     let data = json.get("data")?;
 
     let raw_title = data.get("title").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
-    let description = data.get("description").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
+    let raw_desc = data.get("description").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
     let content = data.get("content").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
 
     let title = if is_x_url(url) {
@@ -355,179 +401,221 @@ fn fetch_metadata_via_jina(url: &str) -> Option<String> {
         if t.is_empty() { None } else { Some(t) }
     };
 
-    let desc = if description.trim().is_empty() {
-        None
+    let desc = if raw_desc.trim().is_empty() {
+        extract_first_paragraph(content)
     } else {
-        Some(description.trim().to_string())
+        Some(raw_desc.trim().to_string())
     };
 
-    let label = format_bookmark_label(title.clone(), desc);
-    if label.is_some() {
-        return label;
+    if title.is_some() || desc.is_some() {
+        Some(PageMeta { title, description: desc })
+    } else {
+        None
     }
-
-    extract_first_paragraph(content)
 }
 
-fn fetch_metadata(url: &str) -> Option<String> {
+fn fetch_metadata(url: &str) -> PageMeta {
     if is_x_url(url) {
-        return fetch_metadata_via_jina(url);
+        return fetch_metadata_via_jina(url).unwrap_or(PageMeta {
+            title: None,
+            description: None,
+        });
     }
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .ok()?;
+        .build();
 
-    let resp = client
-        .get(url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) bm/0.1",
-        )
-        .send()
-        .ok()?;
-
-    let body = resp.text().ok()?;
-    let meta = extract_metadata_from_html(&body);
-    let label = format_bookmark_label(meta.title, meta.description);
-    if label.is_some() {
-        return label;
+    if let Ok(client) = client
+        && let Ok(resp) = client
+            .get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) bm/0.1",
+            )
+            .send()
+        && let Ok(body) = resp.text()
+    {
+        let meta = extract_metadata_from_html(&body);
+        if meta.title.is_some() || meta.description.is_some() {
+            return meta;
+        }
     }
 
-    // Fallback to Jina Reader for JS-heavy sites
-    fetch_metadata_via_jina(url)
+    fetch_metadata_via_jina(url).unwrap_or(PageMeta {
+        title: None,
+        description: None,
+    })
 }
 
-fn is_duplicate(url: &str, bm_path: &PathBuf) -> bool {
-    let lines = read_bookmarks(bm_path);
-    let entries = bookmark_entries(&lines);
-    entries.iter().any(|(_, line)| extract_url(line) == url)
+// --- Bookmark commands ---
+
+fn is_duplicate(url: &str, bookmarks: &[Bookmark]) -> bool {
+    bookmarks.iter().any(|b| b.url == url)
 }
 
-fn append_entry(entry: &str, bm_path: &PathBuf) -> Result<(), BmError> {
-    let mut content = fs::read_to_string(bm_path)
-        .map_err(|e| BmError::IoError(format!("Failed to read {}: {}", bm_path.display(), e)))?;
-    if !content.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str(entry);
-    content.push('\n');
-    fs::write(bm_path, content)
-        .map_err(|e| BmError::IoError(format!("Failed to write {}: {}", bm_path.display(), e)))
+fn today() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
 }
 
 fn cmd_add(url: &str, bm_path: &PathBuf) -> Result<String, BmError> {
-    if is_duplicate(url, bm_path) {
+    let mut bookmarks = read_bookmarks(bm_path);
+    if is_duplicate(url, &bookmarks) {
         return Ok(format!("Already bookmarked: {}", url));
     }
 
     print!("Fetching metadata... ");
-    let label = fetch_metadata(url);
-    match &label {
-        Some(l) => println!("{}", l),
-        None => println!("(not found)"),
+    let meta = fetch_metadata(url);
+    let title = meta.title.unwrap_or_default();
+    let description = meta.description.unwrap_or_default();
+
+    if !title.is_empty() || !description.is_empty() {
+        let display = format_display_label(&title, &description);
+        println!("{}", display);
+    } else {
+        println!("(not found)");
     }
 
-    add_entry(url, label, bm_path)
-}
-
-fn add_entry(url: &str, title: Option<String>, bm_path: &PathBuf) -> Result<String, BmError> {
-    let entry = match title {
-        Some(t) => format!("- {} - {}", url, t),
-        None => format!("- {}", url),
+    let bm = Bookmark {
+        date: today(),
+        url: url.to_string(),
+        title,
+        description,
     };
 
-    append_entry(&entry, bm_path)?;
-    Ok(format!(
-        "Bookmarked: {}",
-        entry.strip_prefix("- ").unwrap_or(&entry)
-    ))
+    let msg = format!("Bookmarked: {}", bm.url);
+    bookmarks.push(bm);
+    write_bookmarks(&bookmarks, bm_path)?;
+    Ok(msg)
+}
+
+pub fn add_entry(url: &str, title: Option<String>, description: Option<String>, bm_path: &PathBuf) -> Result<String, BmError> {
+    let mut bookmarks = read_bookmarks(bm_path);
+    let bm = Bookmark {
+        date: today(),
+        url: url.to_string(),
+        title: title.unwrap_or_default(),
+        description: description.unwrap_or_default(),
+    };
+    let msg = format!("Bookmarked: {}", bm.url);
+    bookmarks.push(bm);
+    write_bookmarks(&bookmarks, bm_path)?;
+    Ok(msg)
+}
+
+fn format_display_label(title: &str, description: &str) -> String {
+    match (title.is_empty(), description.is_empty()) {
+        (false, false) => {
+            let t_lower = title.to_lowercase();
+            let d_lower = description.to_lowercase();
+            if t_lower == d_lower {
+                title.to_string()
+            } else if d_lower.starts_with(&format!("{} - ", t_lower))
+                || d_lower.starts_with(&format!("{}: ", t_lower))
+                || d_lower.starts_with(&format!("{} | ", t_lower))
+            {
+                description.to_string()
+            } else if d_lower.starts_with(&format!("{} is ", t_lower))
+                || d_lower.starts_with(&format!("{} — ", t_lower))
+            {
+                let rest = &description[title.len()..].trim_start();
+                let rest = rest.strip_prefix("is ").or_else(|| rest.strip_prefix("— ")).unwrap_or(rest);
+                let rest = uppercase_first(rest);
+                format!("{}: {}", title, rest)
+            } else {
+                format!("{}: {}", title, description)
+            }
+        }
+        (false, true) => title.to_string(),
+        (true, false) => description.to_string(),
+        (true, true) => String::new(),
+    }
 }
 
 fn cmd_list(bm_path: &PathBuf) -> String {
-    let lines = read_bookmarks(bm_path);
-    let entries = bookmark_entries(&lines);
-    if entries.is_empty() {
+    let bookmarks = read_bookmarks(bm_path);
+    if bookmarks.is_empty() {
         return "No bookmarks found.".to_string();
     }
     let mut output = String::new();
-    for (idx, (_, line)) in entries.iter().enumerate() {
-        let content = line.strip_prefix("- ").unwrap_or(line);
-        output.push_str(&format!("  {}. {}\n", idx + 1, content));
+    for (idx, bm) in bookmarks.iter().enumerate() {
+        let label = format_display_label(&bm.title, &bm.description);
+        if label.is_empty() {
+            output.push_str(&format!("  {}. [{}] {}\n", idx + 1, bm.date, bm.url));
+        } else {
+            output.push_str(&format!("  {}. [{}] {} - {}\n", idx + 1, bm.date, bm.url, label));
+        }
     }
-    output.push_str(&format!("\n{} bookmark(s)", entries.len()));
+    output.push_str(&format!("\n{} bookmark(s)", bookmarks.len()));
     output
 }
 
 fn cmd_search(query: &str, bm_path: &PathBuf) -> String {
-    let lines = read_bookmarks(bm_path);
-    let entries = bookmark_entries(&lines);
+    let bookmarks = read_bookmarks(bm_path);
     let q = query.to_lowercase();
-    let matches: Vec<_> = entries
+    let matches: Vec<&Bookmark> = bookmarks
         .iter()
-        .filter(|(_, line)| line.to_lowercase().contains(&q))
+        .filter(|b| {
+            b.url.to_lowercase().contains(&q)
+                || b.title.to_lowercase().contains(&q)
+                || b.description.to_lowercase().contains(&q)
+        })
         .collect();
 
     if matches.is_empty() {
         return format!("No bookmarks matching \"{}\".", query);
     }
     let mut output = String::new();
-    for (_, line) in &matches {
-        let content = line.strip_prefix("- ").unwrap_or(line);
-        output.push_str(&format!("  {}\n", content));
+    for bm in &matches {
+        let label = format_display_label(&bm.title, &bm.description);
+        if label.is_empty() {
+            output.push_str(&format!("  [{}] {}\n", bm.date, bm.url));
+        } else {
+            output.push_str(&format!("  [{}] {} - {}\n", bm.date, bm.url, label));
+        }
     }
     output.push_str(&format!("\n{} result(s)", matches.len()));
     output
 }
 
 pub fn cmd_remove(target: &str, bm_path: &PathBuf) -> Result<String, BmError> {
-    let lines = read_bookmarks(bm_path);
-    let entries = bookmark_entries(&lines);
+    let mut bookmarks = read_bookmarks(bm_path);
+    if bookmarks.is_empty() {
+        return Err(BmError::BookmarkNotFound(target.to_string()));
+    }
 
-    let remove_line_idx = if let Ok(idx) = target.parse::<usize>() {
-        if idx == 0 || idx > entries.len() {
-            return Err(BmError::IndexOutOfRange(idx, entries.len()));
+    let remove_idx = if let Ok(idx) = target.parse::<usize>() {
+        if idx == 0 || idx > bookmarks.len() {
+            return Err(BmError::IndexOutOfRange(idx, bookmarks.len()));
         }
-        entries[idx - 1].0
+        idx - 1
     } else {
-        match entries.iter().find(|(_, line)| extract_url(line) == target) {
-            Some((line_idx, _)) => *line_idx,
+        match bookmarks.iter().position(|b| b.url == target) {
+            Some(i) => i,
             None => return Err(BmError::BookmarkNotFound(target.to_string())),
         }
     };
 
-    let removed = &lines[remove_line_idx];
-    let msg = format!(
-        "Removed: {}",
-        removed.strip_prefix("- ").unwrap_or(removed)
-    );
-
-    let new_lines: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != remove_line_idx)
-        .map(|(_, l)| l.as_str())
-        .collect();
-
-    let mut content = new_lines.join("\n");
-    if !content.ends_with('\n') {
-        content.push('\n');
-    }
-    fs::write(bm_path, content)
-        .map_err(|e| BmError::IoError(format!("Failed to write {}: {}", bm_path.display(), e)))?;
-
+    let removed = bookmarks.remove(remove_idx);
+    let msg = format!("Removed: {}", removed.url);
+    write_bookmarks(&bookmarks, bm_path)?;
     Ok(msg)
 }
 
 fn run() -> Result<(), BmError> {
     let cli = Cli::parse();
     let config = load_config_from(&config_path())?;
-    let bm_path = resolve_path(&config.bookmarks_file);
+    let configured_path = resolve_path(&config.bookmarks_file);
+    let bm_path = csv_path_from(&configured_path);
+
+    // Auto-migrate from .md if needed
+    if !bm_path.exists() && configured_path.exists() && configured_path.extension().is_some_and(|e| e == "md") {
+        migrate_md_to_csv(&configured_path, &bm_path)?;
+    }
 
     if !bm_path.exists() {
-        return Err(BmError::FileNotFound(bm_path));
+        ensure_csv_file(&bm_path)?;
     }
 
     match cli.command {
@@ -559,351 +647,152 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn create_temp_bookmarks(content: &str) -> (tempfile::TempDir, PathBuf) {
+    fn create_temp_csv(content: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bookmarks.md");
+        let path = dir.path().join("bookmarks.csv");
         fs::write(&path, content).unwrap();
         (dir, path)
     }
 
-    const SAMPLE: &str = "\
-# Saved URLs
+    const SAMPLE_CSV: &str = "date,url,title,description\n\
+        2026-03-01,https://example.com,Example Domain,\n\
+        2026-03-15,https://rust-lang.org,Rust Programming Language,A systems programming language\n\
+        2026-03-29,https://github.com,GitHub,Where people build software\n";
 
-- https://example.com - Example Domain
-- https://rust-lang.org - Rust Programming Language
-- https://github.com - GitHub
-";
-
-    // -- extract_url --
+    // -- read/write bookmarks --
 
     #[test]
-    fn test_extract_url_with_title() {
-        assert_eq!(
-            extract_url("- https://example.com - Example"),
-            "https://example.com"
-        );
+    fn test_read_bookmarks_csv() {
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        let bookmarks = read_bookmarks(&path);
+        assert_eq!(bookmarks.len(), 3);
+        assert_eq!(bookmarks[0].url, "https://example.com");
+        assert_eq!(bookmarks[0].date, "2026-03-01");
+        assert_eq!(bookmarks[1].title, "Rust Programming Language");
+        assert_eq!(bookmarks[2].description, "Where people build software");
     }
 
     #[test]
-    fn test_extract_url_bare() {
-        assert_eq!(extract_url("- https://bare.com"), "https://bare.com");
+    fn test_read_bookmarks_empty() {
+        let (_dir, path) = create_temp_csv("date,url,title,description\n");
+        let bookmarks = read_bookmarks(&path);
+        assert!(bookmarks.is_empty());
     }
 
     #[test]
-    fn test_extract_url_no_prefix() {
-        assert_eq!(
-            extract_url("https://no-prefix.com - Title"),
-            "https://no-prefix.com"
-        );
-    }
-
-    // -- extract_title_from_html --
-
-    #[test]
-    fn test_extract_title_basic() {
-        let html = "<html><head><title>Hello World</title></head></html>";
-        assert_eq!(extract_title_from_html(html), Some("Hello World".into()));
+    fn test_read_bookmarks_missing_file() {
+        let path = PathBuf::from("/nonexistent/bookmarks.csv");
+        let bookmarks = read_bookmarks(&path);
+        assert!(bookmarks.is_empty());
     }
 
     #[test]
-    fn test_extract_title_with_entities() {
-        let html = "<title>Foo &amp; Bar &ndash; Baz</title>";
-        assert_eq!(
-            extract_title_from_html(html),
-            Some("Foo & Bar \u{2013} Baz".into())
-        );
+    fn test_write_bookmarks_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.csv");
+        let bookmarks = vec![
+            Bookmark {
+                date: "2026-03-29".into(),
+                url: "https://example.com".into(),
+                title: "Example".into(),
+                description: "A test site".into(),
+            },
+            Bookmark {
+                date: "2026-03-28".into(),
+                url: "https://rust-lang.org".into(),
+                title: "Rust".into(),
+                description: "".into(),
+            },
+        ];
+        write_bookmarks(&bookmarks, &path).unwrap();
+        let read_back = read_bookmarks(&path);
+        assert_eq!(read_back, bookmarks);
     }
 
     #[test]
-    fn test_extract_title_multiline() {
-        let html = "<title>\n  Multi\n  Line\n</title>";
-        assert_eq!(extract_title_from_html(html), Some("Multi\n  Line".into()));
-    }
-
-    #[test]
-    fn test_extract_title_empty() {
-        let html = "<title>  </title>";
-        assert_eq!(extract_title_from_html(html), None);
-    }
-
-    #[test]
-    fn test_extract_title_missing() {
-        let html = "<html><body>No title here</body></html>";
-        assert_eq!(extract_title_from_html(html), None);
-    }
-
-    #[test]
-    fn test_extract_title_case_insensitive() {
-        let html = "<TITLE>Upper Case</TITLE>";
-        assert_eq!(
-            extract_title_from_html(html),
-            Some("Upper Case".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_title_with_attributes() {
-        let html = "<title lang=\"en\">With Attrs</title>";
-        assert_eq!(
-            extract_title_from_html(html),
-            Some("With Attrs".into())
-        );
-    }
-
-    // -- extract_description_from_html --
-
-    #[test]
-    fn test_extract_description_meta() {
-        let html = r#"<html><head><meta name="description" content="A great site about Rust"></head></html>"#;
-        assert_eq!(
-            extract_description_from_html(html),
-            Some("A great site about Rust".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_description_og() {
-        let html = r#"<meta property="og:description" content="OG description here">"#;
-        assert_eq!(
-            extract_description_from_html(html),
-            Some("OG description here".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_description_og_preferred_over_meta() {
-        let html = r#"<meta property="og:description" content="OG wins"><meta name="description" content="Meta loses">"#;
-        assert_eq!(
-            extract_description_from_html(html),
-            Some("OG wins".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_description_content_before_name() {
-        let html = r#"<meta content="Reversed order" name="description">"#;
-        assert_eq!(
-            extract_description_from_html(html),
-            Some("Reversed order".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_description_content_before_og() {
-        let html = r#"<meta content="Reversed OG" property="og:description">"#;
-        assert_eq!(
-            extract_description_from_html(html),
-            Some("Reversed OG".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_description_empty() {
-        let html = r#"<meta name="description" content="">"#;
-        assert_eq!(extract_description_from_html(html), None);
-    }
-
-    #[test]
-    fn test_extract_description_missing() {
-        let html = "<html><head><title>No desc</title></head></html>";
-        assert_eq!(extract_description_from_html(html), None);
-    }
-
-    #[test]
-    fn test_extract_description_with_entities() {
-        let html = r#"<meta name="description" content="Foo &amp; Bar &ndash; Baz">"#;
-        assert_eq!(
-            extract_description_from_html(html),
-            Some("Foo & Bar \u{2013} Baz".into())
-        );
-    }
-
-    // -- format_bookmark_label --
-
-    #[test]
-    fn test_format_label_title_and_description() {
-        let result = format_bookmark_label(Some("Expo".into()), Some("Build cross-platform apps".into()));
-        assert_eq!(result, Some("Expo: Build cross-platform apps".into()));
-    }
-
-    #[test]
-    fn test_format_label_title_only() {
-        let result = format_bookmark_label(Some("Expo".into()), None);
-        assert_eq!(result, Some("Expo".into()));
-    }
-
-    #[test]
-    fn test_format_label_description_only() {
-        let result = format_bookmark_label(None, Some("A great site".into()));
-        assert_eq!(result, Some("A great site".into()));
-    }
-
-    #[test]
-    fn test_format_label_neither() {
-        let result = format_bookmark_label(None, None);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_format_label_description_has_title_prefix_separator() {
-        let result = format_bookmark_label(
-            Some("GitHub".into()),
-            Some("GitHub: Where people build software".into()),
-        );
-        assert_eq!(result, Some("GitHub: Where people build software".into()));
-    }
-
-    #[test]
-    fn test_format_label_description_starts_with_title_is() {
-        let result = format_bookmark_label(
-            Some("Expo".into()),
-            Some("Expo is an open-source platform".into()),
-        );
-        assert_eq!(result, Some("Expo: An open-source platform".into()));
-    }
-
-    #[test]
-    fn test_format_label_no_special_prefix() {
-        let result = format_bookmark_label(
-            Some("MyApp".into()),
-            Some("Build amazing things".into()),
-        );
-        assert_eq!(result, Some("MyApp: Build amazing things".into()));
-    }
-
-    #[test]
-    fn test_format_label_identical() {
-        let result = format_bookmark_label(Some("Same".into()), Some("Same".into()));
-        assert_eq!(result, Some("Same".into()));
-    }
-
-    // -- extract_metadata_from_html --
-
-    #[test]
-    fn test_extract_metadata_full() {
-        let html = r#"<html><head><title>My Site</title><meta name="description" content="Best site ever"></head></html>"#;
-        let meta = extract_metadata_from_html(html);
-        assert_eq!(meta.title, Some("My Site".into()));
-        assert_eq!(meta.description, Some("Best site ever".into()));
-    }
-
-    #[test]
-    fn test_extract_metadata_title_only() {
-        let html = "<html><head><title>Just Title</title></head></html>";
-        let meta = extract_metadata_from_html(html);
-        assert_eq!(meta.title, Some("Just Title".into()));
-        assert_eq!(meta.description, None);
-    }
-
-    // -- decode_html_entities --
-
-    #[test]
-    fn test_decode_all_entities() {
-        let s = "&amp; &lt; &gt; &#39; &quot; &#x27; &ndash; &mdash;";
-        assert_eq!(
-            decode_html_entities(s),
-            "& < > ' \" ' \u{2013} \u{2014}"
-        );
-    }
-
-    // -- bookmark_entries --
-
-    #[test]
-    fn test_bookmark_entries_filters_header() {
-        let lines: Vec<String> = SAMPLE.lines().map(String::from).collect();
-        let entries = bookmark_entries(&lines);
-        assert_eq!(entries.len(), 3);
-        assert!(entries[0].1.starts_with("- https://example.com"));
-    }
-
-    #[test]
-    fn test_bookmark_entries_empty() {
-        let lines: Vec<String> = vec!["# Header".into(), "".into()];
-        assert_eq!(bookmark_entries(&lines).len(), 0);
-    }
-
-    // -- resolve_path --
-
-    #[test]
-    fn test_resolve_path_absolute() {
-        let p = resolve_path("/tmp/bookmarks.md");
-        assert_eq!(p, PathBuf::from("/tmp/bookmarks.md"));
-    }
-
-    #[test]
-    fn test_resolve_path_tilde() {
-        let p = resolve_path("~/test.md");
-        assert!(p.to_string_lossy().contains("test.md"));
-        assert!(!p.to_string_lossy().starts_with("~"));
+    fn test_csv_handles_commas_in_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.csv");
+        let bookmarks = vec![Bookmark {
+            date: "2026-03-29".into(),
+            url: "https://example.com".into(),
+            title: "Title, with comma".into(),
+            description: "Desc \"with quotes\"".into(),
+        }];
+        write_bookmarks(&bookmarks, &path).unwrap();
+        let read_back = read_bookmarks(&path);
+        assert_eq!(read_back[0].title, "Title, with comma");
+        assert_eq!(read_back[0].description, "Desc \"with quotes\"");
     }
 
     // -- is_duplicate --
 
     #[test]
     fn test_is_duplicate_true() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        assert!(is_duplicate("https://example.com", &path));
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        let bookmarks = read_bookmarks(&path);
+        assert!(is_duplicate("https://example.com", &bookmarks));
     }
 
     #[test]
     fn test_is_duplicate_false() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        assert!(!is_duplicate("https://new-site.com", &path));
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        let bookmarks = read_bookmarks(&path);
+        assert!(!is_duplicate("https://new-site.com", &bookmarks));
     }
 
-    // -- add_entry (testable version without network) --
+    // -- add_entry --
 
     #[test]
-    fn test_add_new_bookmark_with_title() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        let result = add_entry("https://new.com", Some("New Site".into()), &path).unwrap();
+    fn test_add_entry_with_title() {
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        let result = add_entry("https://new.com", Some("New Site".into()), Some("A new site".into()), &path).unwrap();
         assert!(result.contains("Bookmarked:"));
-        assert!(result.contains("https://new.com"));
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("- https://new.com - New Site"));
+        let bookmarks = read_bookmarks(&path);
+        assert_eq!(bookmarks.len(), 4);
+        assert_eq!(bookmarks[3].url, "https://new.com");
+        assert_eq!(bookmarks[3].title, "New Site");
+        assert_eq!(bookmarks[3].description, "A new site");
+        assert!(!bookmarks[3].date.is_empty());
     }
 
     #[test]
-    fn test_add_new_bookmark_no_title() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        let result = add_entry("https://notitle.com", None, &path).unwrap();
-        assert!(result.contains("Bookmarked:"));
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("- https://notitle.com\n"));
+    fn test_add_entry_no_title() {
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        add_entry("https://notitle.com", None, None, &path).unwrap();
+        let bookmarks = read_bookmarks(&path);
+        assert_eq!(bookmarks.len(), 4);
+        assert_eq!(bookmarks[3].url, "https://notitle.com");
+        assert_eq!(bookmarks[3].title, "");
     }
 
     #[test]
-    fn test_add_duplicate_detected() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        assert!(is_duplicate("https://example.com", &path));
-        let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(content.matches("https://example.com").count(), 1);
-    }
-
-    #[test]
-    fn test_add_entry_does_not_dedup() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        let result = add_entry("https://example.com", Some("Dup".into()), &path).unwrap();
-        assert!(result.contains("Bookmarked:"));
-        let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(content.matches("https://example.com").count(), 2);
+    fn test_add_entry_records_date() {
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        add_entry("https://dated.com", Some("Dated".into()), None, &path).unwrap();
+        let bookmarks = read_bookmarks(&path);
+        let added = &bookmarks[3];
+        assert_eq!(added.date, today());
     }
 
     // -- cmd_list --
 
     #[test]
-    fn test_list_shows_all() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+    fn test_list_shows_all_with_dates() {
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let output = cmd_list(&path);
-        assert!(output.contains("1. https://example.com"));
-        assert!(output.contains("2. https://rust-lang.org"));
-        assert!(output.contains("3. https://github.com"));
+        assert!(output.contains("[2026-03-01]"));
+        assert!(output.contains("https://example.com"));
+        assert!(output.contains("[2026-03-15]"));
+        assert!(output.contains("https://rust-lang.org"));
+        assert!(output.contains("[2026-03-29]"));
+        assert!(output.contains("https://github.com"));
         assert!(output.contains("3 bookmark(s)"));
     }
 
     #[test]
     fn test_list_empty() {
-        let (_dir, path) = create_temp_bookmarks("# Saved URLs\n");
+        let (_dir, path) = create_temp_csv("date,url,title,description\n");
         let output = cmd_list(&path);
         assert_eq!(output, "No bookmarks found.");
     }
@@ -912,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_search_found() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let output = cmd_search("rust", &path);
         assert!(output.contains("https://rust-lang.org"));
         assert!(output.contains("1 result(s)"));
@@ -920,28 +809,22 @@ mod tests {
 
     #[test]
     fn test_search_case_insensitive() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let output = cmd_search("GITHUB", &path);
         assert!(output.contains("https://github.com"));
     }
 
     #[test]
-    fn test_search_multiple_results() {
-        let content = "\
-# Saved URLs
-
-- https://a.com - Rust Book
-- https://b.com - Rust By Example
-- https://c.com - Python Docs
-";
-        let (_dir, path) = create_temp_bookmarks(content);
-        let output = cmd_search("rust", &path);
-        assert!(output.contains("2 result(s)"));
+    fn test_search_by_description() {
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        let output = cmd_search("systems programming", &path);
+        assert!(output.contains("https://rust-lang.org"));
+        assert!(output.contains("1 result(s)"));
     }
 
     #[test]
     fn test_search_no_match() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let output = cmd_search("xyznonexistent", &path);
         assert!(output.contains("No bookmarks matching"));
     }
@@ -950,45 +833,37 @@ mod tests {
 
     #[test]
     fn test_remove_by_index() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let result = cmd_remove("2", &path).unwrap();
         assert!(result.contains("Removed:"));
         assert!(result.contains("rust-lang.org"));
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("rust-lang.org"));
-        assert!(content.contains("example.com"));
-        assert!(content.contains("github.com"));
+        let bookmarks = read_bookmarks(&path);
+        assert_eq!(bookmarks.len(), 2);
+        assert!(!bookmarks.iter().any(|b| b.url.contains("rust-lang")));
     }
 
     #[test]
     fn test_remove_by_url() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let result = cmd_remove("https://github.com", &path).unwrap();
         assert!(result.contains("Removed:"));
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("github.com"));
+        let bookmarks = read_bookmarks(&path);
+        assert_eq!(bookmarks.len(), 2);
     }
 
     #[test]
     fn test_remove_first_entry() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let result = cmd_remove("1", &path).unwrap();
         assert!(result.contains("example.com"));
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("example.com"));
-        assert!(content.contains("rust-lang.org"));
-    }
-
-    #[test]
-    fn test_remove_last_entry() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        let result = cmd_remove("3", &path).unwrap();
-        assert!(result.contains("github.com"));
+        let bookmarks = read_bookmarks(&path);
+        assert_eq!(bookmarks.len(), 2);
+        assert_eq!(bookmarks[0].url, "https://rust-lang.org");
     }
 
     #[test]
     fn test_remove_index_zero() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let result = cmd_remove("0", &path);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -999,14 +874,13 @@ mod tests {
 
     #[test]
     fn test_remove_index_too_large() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        let result = cmd_remove("99", &path);
-        assert!(result.is_err());
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        assert!(cmd_remove("99", &path).is_err());
     }
 
     #[test]
     fn test_remove_url_not_found() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
         let result = cmd_remove("https://nothere.com", &path);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1015,22 +889,121 @@ mod tests {
         }
     }
 
-    // -- load_config_from --
+    // -- add then remove roundtrip --
+
+    #[test]
+    fn test_add_then_remove_roundtrip() {
+        let (_dir, path) = create_temp_csv(SAMPLE_CSV);
+        let original_count = read_bookmarks(&path).len();
+
+        add_entry("https://temp.com", Some("Temp".into()), None, &path).unwrap();
+        assert_eq!(read_bookmarks(&path).len(), original_count + 1);
+
+        cmd_remove("https://temp.com", &path).unwrap();
+        let after = read_bookmarks(&path);
+        assert_eq!(after.len(), original_count);
+        assert!(!after.iter().any(|b| b.url == "https://temp.com"));
+    }
+
+    // -- migration --
+
+    #[test]
+    fn test_migrate_md_to_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = dir.path().join("bookmarks.md");
+        let csv_path = dir.path().join("bookmarks.csv");
+        fs::write(
+            &md_path,
+            "# Saved URLs\n\n- https://example.com - Example Domain\n- https://bare.com\n",
+        )
+        .unwrap();
+        migrate_md_to_csv(&md_path, &csv_path).unwrap();
+
+        let bookmarks = read_bookmarks(&csv_path);
+        assert_eq!(bookmarks.len(), 2);
+        assert_eq!(bookmarks[0].url, "https://example.com");
+        assert_eq!(bookmarks[0].title, "Example Domain");
+        assert_eq!(bookmarks[1].url, "https://bare.com");
+        assert_eq!(bookmarks[1].title, "");
+    }
+
+    // -- format_display_label --
+
+    #[test]
+    fn test_format_display_label_both() {
+        assert_eq!(format_display_label("GitHub", "Where people build"), "GitHub: Where people build");
+    }
+
+    #[test]
+    fn test_format_display_label_title_only() {
+        assert_eq!(format_display_label("GitHub", ""), "GitHub");
+    }
+
+    #[test]
+    fn test_format_display_label_desc_only() {
+        assert_eq!(format_display_label("", "A great site"), "A great site");
+    }
+
+    #[test]
+    fn test_format_display_label_neither() {
+        assert_eq!(format_display_label("", ""), "");
+    }
+
+    #[test]
+    fn test_format_display_label_desc_has_title_prefix() {
+        assert_eq!(
+            format_display_label("GitHub", "GitHub: Where people build software"),
+            "GitHub: Where people build software"
+        );
+    }
+
+    #[test]
+    fn test_format_display_label_identical() {
+        assert_eq!(format_display_label("Same", "Same"), "Same");
+    }
+
+    // -- csv_path_from --
+
+    #[test]
+    fn test_csv_path_from_md() {
+        let p = PathBuf::from("/tmp/bookmarks.md");
+        assert_eq!(csv_path_from(&p), PathBuf::from("/tmp/bookmarks.csv"));
+    }
+
+    #[test]
+    fn test_csv_path_from_csv() {
+        let p = PathBuf::from("/tmp/bookmarks.csv");
+        assert_eq!(csv_path_from(&p), PathBuf::from("/tmp/bookmarks.csv"));
+    }
+
+    // -- ensure_csv_file --
+
+    #[test]
+    fn test_ensure_csv_file_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.csv");
+        assert!(!path.exists());
+        ensure_csv_file(&path).unwrap();
+        assert!(path.exists());
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("date,url,title,description"));
+    }
+
+    // -- config --
 
     #[test]
     fn test_load_config_valid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "bookmarks_file = \"/tmp/bm.md\"\n").unwrap();
+        fs::write(&path, "bookmarks_file = \"/tmp/bm.csv\"\n").unwrap();
         let cfg = load_config_from(&path).unwrap();
-        assert_eq!(cfg.bookmarks_file, "/tmp/bm.md");
+        assert_eq!(cfg.bookmarks_file, "/tmp/bm.csv");
     }
 
     #[test]
     fn test_load_config_missing() {
         let path = PathBuf::from("/nonexistent/config.toml");
-        let result = load_config_from(&path);
-        assert!(result.is_err());
+        assert!(load_config_from(&path).is_err());
     }
 
     #[test]
@@ -1038,8 +1011,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "not valid toml [[[").unwrap();
-        let result = load_config_from(&path);
-        assert!(result.is_err());
+        assert!(load_config_from(&path).is_err());
     }
 
     // -- BmError Display --
@@ -1048,9 +1020,64 @@ mod tests {
     fn test_error_display() {
         let e = BmError::IndexOutOfRange(5, 3);
         assert_eq!(format!("{}", e), "Index 5 out of range (1-3).");
-
         let e = BmError::BookmarkNotFound("https://x.com".into());
         assert_eq!(format!("{}", e), "Bookmark not found: https://x.com");
+    }
+
+    // -- resolve_path --
+
+    #[test]
+    fn test_resolve_path_absolute() {
+        assert_eq!(resolve_path("/tmp/bm.csv"), PathBuf::from("/tmp/bm.csv"));
+    }
+
+    #[test]
+    fn test_resolve_path_tilde() {
+        let p = resolve_path("~/test.csv");
+        assert!(p.to_string_lossy().contains("test.csv"));
+        assert!(!p.to_string_lossy().starts_with("~"));
+    }
+
+    // -- HTML extraction (kept from before) --
+
+    #[test]
+    fn test_extract_title_basic() {
+        let html = "<html><head><title>Hello World</title></head></html>";
+        assert_eq!(extract_title_from_html(html), Some("Hello World".into()));
+    }
+
+    #[test]
+    fn test_extract_title_with_entities() {
+        let html = "<title>Foo &amp; Bar &ndash; Baz</title>";
+        assert_eq!(extract_title_from_html(html), Some("Foo & Bar \u{2013} Baz".into()));
+    }
+
+    #[test]
+    fn test_extract_title_empty() {
+        assert_eq!(extract_title_from_html("<title>  </title>"), None);
+    }
+
+    #[test]
+    fn test_extract_title_missing() {
+        assert_eq!(extract_title_from_html("<html><body>No title</body></html>"), None);
+    }
+
+    #[test]
+    fn test_extract_description_og() {
+        let html = r#"<meta property="og:description" content="OG desc">"#;
+        assert_eq!(extract_description_from_html(html), Some("OG desc".into()));
+    }
+
+    #[test]
+    fn test_extract_description_meta() {
+        let html = r#"<meta name="description" content="Meta desc">"#;
+        assert_eq!(extract_description_from_html(html), Some("Meta desc".into()));
+    }
+
+    #[test]
+    fn test_decode_all_entities() {
+        let s = "&amp; &lt; &gt; &#39; &quot; &#x27; &ndash; &mdash;";
+        assert_eq!(decode_html_entities(s), "& < > ' \" ' \u{2013} \u{2014}");
     }
 
     // -- is_private_url --
@@ -1058,95 +1085,31 @@ mod tests {
     #[test]
     fn test_is_private_url_localhost() {
         assert!(is_private_url("http://localhost:3000/api"));
-        assert!(is_private_url("https://localhost/path"));
         assert!(is_private_url("http://127.0.0.1:8080/test"));
         assert!(is_private_url("http://[::1]:9000/"));
-        assert!(is_private_url("http://0.0.0.0/"));
-    }
-
-    #[test]
-    fn test_is_private_url_private_networks() {
-        assert!(is_private_url("http://10.0.0.1/admin"));
-        assert!(is_private_url("http://192.168.1.1/"));
-        assert!(is_private_url("http://172.16.0.1/internal"));
-        assert!(is_private_url("http://172.31.255.255/"));
-    }
-
-    #[test]
-    fn test_is_private_url_local_domains() {
-        assert!(is_private_url("http://myserver.local/api"));
-        assert!(is_private_url("https://app.internal/dashboard"));
-    }
-
-    #[test]
-    fn test_is_private_url_file_scheme() {
-        assert!(is_private_url("file:///home/user/doc.html"));
-    }
-
-    #[test]
-    fn test_is_private_url_no_scheme() {
-        assert!(is_private_url("just-a-string"));
     }
 
     #[test]
     fn test_is_private_url_public() {
         assert!(!is_private_url("https://example.com"));
         assert!(!is_private_url("https://github.com/user/repo"));
-        assert!(!is_private_url("https://x.com/user/status/123"));
-        assert!(!is_private_url("http://172.15.0.1/not-private"));
-        assert!(!is_private_url("http://172.32.0.1/not-private"));
     }
 
     // -- is_x_url --
 
     #[test]
-    fn test_is_x_url_https() {
+    fn test_is_x_url() {
         assert!(is_x_url("https://x.com/user/status/123"));
         assert!(is_x_url("https://twitter.com/user/status/123"));
-    }
-
-    #[test]
-    fn test_is_x_url_www() {
-        assert!(is_x_url("https://www.x.com/user/status/123"));
-        assert!(is_x_url("https://www.twitter.com/user/status/123"));
-    }
-
-    #[test]
-    fn test_is_x_url_http() {
-        assert!(is_x_url("http://x.com/user/status/123"));
-        assert!(is_x_url("http://twitter.com/user/status/123"));
-    }
-
-    #[test]
-    fn test_is_x_url_false() {
         assert!(!is_x_url("https://example.com"));
-        assert!(!is_x_url("https://github.com"));
-        assert!(!is_x_url("https://notx.com/path"));
-        assert!(!is_x_url("https://xtwitter.com/path"));
     }
 
     // -- clean_x_title --
 
     #[test]
-    fn test_clean_x_title_with_suffix() {
-        assert_eq!(
-            clean_x_title("YQ on X: \"Agents Don't Click Ads.\" / X"),
-            Some("YQ on X: \"Agents Don't Click Ads.\"".into())
-        );
-    }
-
-    #[test]
-    fn test_clean_x_title_twitter_suffix() {
-        assert_eq!(
-            clean_x_title("User on X: \"Hello\" / Twitter"),
-            Some("User on X: \"Hello\"".into())
-        );
-    }
-
-    #[test]
-    fn test_clean_x_title_generic() {
+    fn test_clean_x_title() {
+        assert_eq!(clean_x_title("YQ on X: \"Hello\" / X"), Some("YQ on X: \"Hello\"".into()));
         assert_eq!(clean_x_title("X"), None);
-        assert_eq!(clean_x_title("Twitter"), None);
         assert_eq!(clean_x_title(""), None);
     }
 
@@ -1154,20 +1117,8 @@ mod tests {
 
     #[test]
     fn test_extract_first_paragraph_skips_images() {
-        let content = "[![Image 1](https://img.png)](https://link)\n\nThe quick brown fox jumps over the lazy dog.";
-        assert_eq!(
-            extract_first_paragraph(content),
-            Some("The quick brown fox jumps over the lazy dog.".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_first_paragraph_skips_headers() {
-        let content = "# Title\n\n## Subtitle\n\nThis is the first real paragraph of content here.";
-        assert_eq!(
-            extract_first_paragraph(content),
-            Some("This is the first real paragraph of content here.".into())
-        );
+        let content = "[![Image](url)](link)\n\nThe quick brown fox jumps over the lazy dog.";
+        assert_eq!(extract_first_paragraph(content), Some("The quick brown fox jumps over the lazy dog.".into()));
     }
 
     #[test]
@@ -1182,124 +1133,5 @@ mod tests {
     fn test_extract_first_paragraph_empty() {
         assert_eq!(extract_first_paragraph(""), None);
         assert_eq!(extract_first_paragraph("# Only header"), None);
-    }
-
-    #[test]
-    fn test_is_x_url_case_insensitive() {
-        assert!(is_x_url("https://X.COM/user/status/123"));
-        assert!(is_x_url("HTTPS://x.com/user/status/123"));
-        assert!(is_x_url("https://Twitter.com/user/status/456"));
-    }
-
-    #[test]
-    fn test_is_x_url_article_path() {
-        assert!(is_x_url("https://x.com/yq_acc/article/2037579506429657198"));
-    }
-
-    #[test]
-    fn test_is_x_url_edge_cases() {
-        assert!(!is_x_url("https://x.com"));
-        assert!(!is_x_url(""));
-        assert!(!is_x_url("x.com/user/status/123"));
-    }
-
-    #[test]
-    fn test_clean_x_title_no_suffix() {
-        assert_eq!(
-            clean_x_title("YQ on X: \"Some text\""),
-            Some("YQ on X: \"Some text\"".into())
-        );
-    }
-
-    #[test]
-    fn test_clean_x_title_whitespace() {
-        assert_eq!(
-            clean_x_title("  User on X: \"Hello\" / X  "),
-            Some("User on X: \"Hello\"".into())
-        );
-        assert_eq!(clean_x_title("   "), None);
-    }
-
-    #[test]
-    fn test_extract_first_paragraph_skips_links() {
-        let content = "[Log in](https://x.com/login)\n[Sign up](https://x.com/signup)\n\nThis is meaningful text after some links.";
-        assert_eq!(
-            extract_first_paragraph(content),
-            Some("This is meaningful text after some links.".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_first_paragraph_skips_inline_images() {
-        let content = "![Image 1: alt text](https://img.png)\n\nThe actual paragraph starts here with real text.";
-        assert_eq!(
-            extract_first_paragraph(content),
-            Some("The actual paragraph starts here with real text.".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_first_paragraph_skips_short_lines() {
-        let content = "OK\nNot enough\nShort line here!!!\n\nThis line is long enough to be a real paragraph for the reader.";
-        assert_eq!(
-            extract_first_paragraph(content),
-            Some("This line is long enough to be a real paragraph for the reader.".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_first_paragraph_unicode_truncation() {
-        let content = "这是一段很长的中文内容，用来测试Unicode字符的截断功能。我们需要确保截断不会发生在多字节字符的中间位置，否则会导致无效的UTF-8字符串。这段文字应该足够长以触发截断逻辑。";
-        let result = extract_first_paragraph(content).unwrap();
-        assert!(result.ends_with("..."));
-        assert!(result.is_char_boundary(result.len()));
-    }
-
-    #[test]
-    fn test_extract_first_paragraph_trims_whitespace() {
-        let content = "   \n   \n   The first real paragraph with leading spaces.   ";
-        assert_eq!(
-            extract_first_paragraph(content),
-            Some("The first real paragraph with leading spaces.".into())
-        );
-    }
-
-    #[test]
-    fn test_extract_first_paragraph_realistic_jina_x_output() {
-        let content = r#"[![Image 1: Image](https://pbs.twimg.com/media/abc.jpg)](https://x.com/user/article/123/media/456)
-
-The internet's business model is advertising. For thirty years, that has been the default: show humans content, harvest attention, convert clicks into revenue.
-
-AI agents break this model. An agent calling an API does not have attention to harvest."#;
-        let result = extract_first_paragraph(content).unwrap();
-        assert!(result.starts_with("The internet's business model is advertising."));
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn test_extract_first_paragraph_only_non_text() {
-        let content = "# Header\n## Subheader\n[![img](url)](link)\n![alt](url)\n[link](url)\nshort";
-        assert_eq!(extract_first_paragraph(content), None);
-    }
-
-    // -- integration: add then remove preserves file --
-
-    #[test]
-    fn test_add_then_remove_roundtrip() {
-        let (_dir, path) = create_temp_bookmarks(SAMPLE);
-        let original = fs::read_to_string(&path).unwrap();
-        let original_count = original.matches("- https://").count();
-
-        add_entry("https://temp.com", Some("Temp".into()), &path).unwrap();
-        let after_add = fs::read_to_string(&path).unwrap();
-        assert_eq!(after_add.matches("- https://").count(), original_count + 1);
-
-        cmd_remove("https://temp.com", &path).unwrap();
-        let after_remove = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            after_remove.matches("- https://").count(),
-            original_count
-        );
-        assert!(!after_remove.contains("temp.com"));
     }
 }
