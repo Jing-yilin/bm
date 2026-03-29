@@ -179,17 +179,16 @@ impl App {
     fn handle_event(&mut self) -> Result<(), BmError> {
         if event::poll(Duration::from_millis(100))
             .map_err(|e| BmError::IoError(e.to_string()))?
+            && let Event::Key(key) = event::read().map_err(|e| BmError::IoError(e.to_string()))?
         {
-            if let Event::Key(key) = event::read().map_err(|e| BmError::IoError(e.to_string()))? {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    self.should_quit = true;
-                    return Ok(());
-                }
-                match self.mode {
-                    Mode::Normal => self.handle_normal_key(key),
-                    Mode::Search => self.handle_search_key(key),
-                    Mode::ConfirmDelete => self.handle_confirm_key(key),
-                }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return Ok(());
+            }
+            match self.mode {
+                Mode::Normal => self.handle_normal_key(key),
+                Mode::Search => self.handle_search_key(key),
+                Mode::ConfirmDelete => self.handle_confirm_key(key),
             }
         }
         Ok(())

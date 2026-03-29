@@ -94,10 +94,10 @@ fn load_config_from(path: &PathBuf) -> Result<Config, BmError> {
 }
 
 fn resolve_path(p: &str) -> PathBuf {
-    if p.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&p[2..]);
-        }
+    if p.starts_with('~')
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(&p[2..]);
     }
     PathBuf::from(p)
 }
@@ -226,6 +226,49 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&mdash;", "\u{2014}")
 }
 
+fn is_private_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    let host_start = if let Some(pos) = lower.find("://") {
+        pos + 3
+    } else {
+        return true;
+    };
+    let host_part = &lower[host_start..];
+    let host_and_port = host_part.split('/').next().unwrap_or("");
+    let host = if host_and_port.starts_with('[') {
+        // IPv6 bracket notation: [::1]:port
+        host_and_port.split(']').next().map(|s| &s[1..]).unwrap_or(host_and_port)
+    } else {
+        host_and_port.split(':').next().unwrap_or(host_and_port)
+    };
+
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("172.16.")
+        || host.starts_with("172.17.")
+        || host.starts_with("172.18.")
+        || host.starts_with("172.19.")
+        || host.starts_with("172.20.")
+        || host.starts_with("172.21.")
+        || host.starts_with("172.22.")
+        || host.starts_with("172.23.")
+        || host.starts_with("172.24.")
+        || host.starts_with("172.25.")
+        || host.starts_with("172.26.")
+        || host.starts_with("172.27.")
+        || host.starts_with("172.28.")
+        || host.starts_with("172.29.")
+        || host.starts_with("172.30.")
+        || host.starts_with("172.31.")
+        || lower.starts_with("file://")
+}
+
 fn is_x_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     lower.starts_with("https://x.com/")
@@ -275,6 +318,10 @@ fn clean_x_title(title: &str) -> Option<String> {
 }
 
 fn fetch_metadata_via_jina(url: &str) -> Option<String> {
+    if is_private_url(url) {
+        return None;
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1004,6 +1051,50 @@ mod tests {
 
         let e = BmError::BookmarkNotFound("https://x.com".into());
         assert_eq!(format!("{}", e), "Bookmark not found: https://x.com");
+    }
+
+    // -- is_private_url --
+
+    #[test]
+    fn test_is_private_url_localhost() {
+        assert!(is_private_url("http://localhost:3000/api"));
+        assert!(is_private_url("https://localhost/path"));
+        assert!(is_private_url("http://127.0.0.1:8080/test"));
+        assert!(is_private_url("http://[::1]:9000/"));
+        assert!(is_private_url("http://0.0.0.0/"));
+    }
+
+    #[test]
+    fn test_is_private_url_private_networks() {
+        assert!(is_private_url("http://10.0.0.1/admin"));
+        assert!(is_private_url("http://192.168.1.1/"));
+        assert!(is_private_url("http://172.16.0.1/internal"));
+        assert!(is_private_url("http://172.31.255.255/"));
+    }
+
+    #[test]
+    fn test_is_private_url_local_domains() {
+        assert!(is_private_url("http://myserver.local/api"));
+        assert!(is_private_url("https://app.internal/dashboard"));
+    }
+
+    #[test]
+    fn test_is_private_url_file_scheme() {
+        assert!(is_private_url("file:///home/user/doc.html"));
+    }
+
+    #[test]
+    fn test_is_private_url_no_scheme() {
+        assert!(is_private_url("just-a-string"));
+    }
+
+    #[test]
+    fn test_is_private_url_public() {
+        assert!(!is_private_url("https://example.com"));
+        assert!(!is_private_url("https://github.com/user/repo"));
+        assert!(!is_private_url("https://x.com/user/status/123"));
+        assert!(!is_private_url("http://172.15.0.1/not-private"));
+        assert!(!is_private_url("http://172.32.0.1/not-private"));
     }
 
     // -- is_x_url --
