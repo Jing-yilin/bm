@@ -9,20 +9,13 @@ use ratatui::{
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::{bookmark_entries, cmd_remove, extract_url, read_bookmarks, BmError};
+use crate::{cmd_remove, format_display_label, read_bookmarks, Bookmark, BmError};
 
 #[derive(PartialEq)]
 enum Mode {
     Normal,
     Search,
     ConfirmDelete,
-}
-
-struct Bookmark {
-    url: String,
-    label: String,
-    #[allow(dead_code)]
-    line_idx: usize,
 }
 
 pub struct App {
@@ -56,25 +49,7 @@ impl App {
     }
 
     fn reload(&mut self) {
-        let lines = read_bookmarks(&self.bm_path);
-        let entries = bookmark_entries(&lines);
-        self.bookmarks = entries
-            .iter()
-            .map(|(line_idx, line)| {
-                let url = extract_url(line).to_string();
-                let stripped = line.strip_prefix("- ").unwrap_or(line);
-                let label = stripped
-                    .strip_prefix(&url)
-                    .and_then(|s| s.strip_prefix(" - "))
-                    .unwrap_or("")
-                    .to_string();
-                Bookmark {
-                    url,
-                    label,
-                    line_idx: *line_idx,
-                }
-            })
-            .collect();
+        self.bookmarks = read_bookmarks(&self.bm_path);
         self.apply_filter();
     }
 
@@ -87,7 +62,9 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, b)| {
-                    b.url.to_lowercase().contains(&q) || b.label.to_lowercase().contains(&q)
+                    b.url.to_lowercase().contains(&q)
+                        || b.title.to_lowercase().contains(&q)
+                        || b.description.to_lowercase().contains(&q)
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -115,11 +92,7 @@ impl App {
         }
         let i = match self.table_state.selected() {
             Some(i) => {
-                if i >= self.filtered.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
+                if i >= self.filtered.len() - 1 { 0 } else { i + 1 }
             }
             None => 0,
         };
@@ -132,11 +105,7 @@ impl App {
         }
         let i = match self.table_state.selected() {
             Some(i) => {
-                if i == 0 {
-                    self.filtered.len() - 1
-                } else {
-                    i - 1
-                }
+                if i == 0 { self.filtered.len() - 1 } else { i - 1 }
             }
             None => 0,
         };
@@ -269,11 +238,8 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let chunks = Layout::vertical([
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
+        let chunks = Layout::vertical([Constraint::Min(5), Constraint::Length(1)])
+            .split(frame.area());
 
         self.render_table(frame, chunks[0]);
         self.render_footer(frame, chunks[1]);
@@ -282,8 +248,9 @@ impl App {
     fn render_table(&mut self, frame: &mut Frame, area: Rect) {
         let header = Row::new(vec![
             Cell::from(" # "),
+            Cell::from("Date"),
             Cell::from("URL"),
-            Cell::from("Description"),
+            Cell::from("Title / Description"),
         ])
         .style(Style::default().bold().fg(Color::Cyan))
         .bottom_margin(0);
@@ -294,10 +261,12 @@ impl App {
             .enumerate()
             .map(|(display_idx, &bm_idx)| {
                 let bm = &self.bookmarks[bm_idx];
+                let label = format_display_label(&bm.title, &bm.description);
                 Row::new(vec![
                     Cell::from(format!("{:>3}", display_idx + 1)),
+                    Cell::from(bm.date.as_str()),
                     Cell::from(bm.url.as_str()),
-                    Cell::from(bm.label.as_str()),
+                    Cell::from(label),
                 ])
             })
             .collect();
@@ -312,8 +281,9 @@ impl App {
 
         let widths = [
             Constraint::Length(4),
-            Constraint::Percentage(40),
-            Constraint::Percentage(55),
+            Constraint::Length(12),
+            Constraint::Percentage(35),
+            Constraint::Percentage(50),
         ];
 
         let table = Table::new(rows, widths)
@@ -357,10 +327,7 @@ impl App {
         }
 
         if self.mode == Mode::Normal && self.status_msg.is_empty() {
-            spans.push(Span::styled(
-                " j/k",
-                Style::default().fg(Color::Cyan),
-            ));
+            spans.push(Span::styled(" j/k", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(":nav "));
             spans.push(Span::styled("Enter", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(":open "));
@@ -380,8 +347,7 @@ impl App {
 }
 
 pub fn run_tui(bm_path: PathBuf) -> Result<(), BmError> {
-    let mut terminal =
-        ratatui::init();
+    let mut terminal = ratatui::init();
     let mut app = App::new(bm_path);
 
     let result = (|| -> Result<(), BmError> {
