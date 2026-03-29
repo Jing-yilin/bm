@@ -125,6 +125,92 @@ fn extract_title_from_html(html: &str) -> Option<String> {
     if title.is_empty() { None } else { Some(title) }
 }
 
+fn extract_description_from_html(html: &str) -> Option<String> {
+    // Try og:description first, then meta description
+    let og_re = Regex::new(r#"(?i)<meta\s[^>]*property\s*=\s*"og:description"[^>]*content\s*=\s*"([^"]*)"[^>]*/?\s*>"#).ok()?;
+    if let Some(caps) = og_re.captures(html) {
+        let desc = decode_html_entities(caps.get(1)?.as_str().trim());
+        if !desc.is_empty() {
+            return Some(desc);
+        }
+    }
+    // Also try content before property order
+    let og_re2 = Regex::new(r#"(?i)<meta\s[^>]*content\s*=\s*"([^"]*)"[^>]*property\s*=\s*"og:description"[^>]*/?\s*>"#).ok()?;
+    if let Some(caps) = og_re2.captures(html) {
+        let desc = decode_html_entities(caps.get(1)?.as_str().trim());
+        if !desc.is_empty() {
+            return Some(desc);
+        }
+    }
+    // Fallback: meta name="description"
+    let meta_re = Regex::new(r#"(?i)<meta\s[^>]*name\s*=\s*"description"[^>]*content\s*=\s*"([^"]*)"[^>]*/?\s*>"#).ok()?;
+    if let Some(caps) = meta_re.captures(html) {
+        let desc = decode_html_entities(caps.get(1)?.as_str().trim());
+        if !desc.is_empty() {
+            return Some(desc);
+        }
+    }
+    let meta_re2 = Regex::new(r#"(?i)<meta\s[^>]*content\s*=\s*"([^"]*)"[^>]*name\s*=\s*"description"[^>]*/?\s*>"#).ok()?;
+    if let Some(caps) = meta_re2.captures(html) {
+        let desc = decode_html_entities(caps.get(1)?.as_str().trim());
+        if !desc.is_empty() {
+            return Some(desc);
+        }
+    }
+    None
+}
+
+struct PageMeta {
+    title: Option<String>,
+    description: Option<String>,
+}
+
+fn extract_metadata_from_html(html: &str) -> PageMeta {
+    PageMeta {
+        title: extract_title_from_html(html),
+        description: extract_description_from_html(html),
+    }
+}
+
+fn format_bookmark_label(title: Option<String>, description: Option<String>) -> Option<String> {
+    match (title, description) {
+        (Some(t), Some(d)) => {
+            let t_lower = t.to_lowercase();
+            let d_lower = d.to_lowercase();
+            if t_lower == d_lower {
+                Some(t)
+            } else if d_lower.starts_with(&format!("{} - ", t_lower))
+                || d_lower.starts_with(&format!("{}: ", t_lower))
+                || d_lower.starts_with(&format!("{} | ", t_lower))
+            {
+                // Description already has "Title: ..." or "Title - ..." pattern
+                Some(d)
+            } else if d_lower.starts_with(&format!("{} is ", t_lower))
+                || d_lower.starts_with(&format!("{} — ", t_lower))
+            {
+                // "Expo is an open-source..." -> "Expo: Open-source..."
+                let rest = &d[t.len()..].trim_start();
+                let rest = rest.strip_prefix("is ").or_else(|| rest.strip_prefix("— ")).unwrap_or(rest);
+                let rest = uppercase_first(rest);
+                Some(format!("{}: {}", t, rest))
+            } else {
+                Some(format!("{}: {}", t, d))
+            }
+        }
+        (Some(t), None) => Some(t),
+        (None, Some(d)) => Some(d),
+        (None, None) => None,
+    }
+}
+
+fn uppercase_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
 fn decode_html_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -136,7 +222,7 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&mdash;", "\u{2014}")
 }
 
-fn fetch_title(url: &str) -> Option<String> {
+fn fetch_metadata(url: &str) -> Option<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -153,7 +239,8 @@ fn fetch_title(url: &str) -> Option<String> {
         .ok()?;
 
     let body = resp.text().ok()?;
-    extract_title_from_html(&body)
+    let meta = extract_metadata_from_html(&body);
+    format_bookmark_label(meta.title, meta.description)
 }
 
 fn is_duplicate(url: &str, bm_path: &PathBuf) -> bool {
@@ -179,14 +266,14 @@ fn cmd_add(url: &str, bm_path: &PathBuf) -> Result<String, BmError> {
         return Ok(format!("Already bookmarked: {}", url));
     }
 
-    print!("Fetching title... ");
-    let title = fetch_title(url);
-    match &title {
-        Some(t) => println!("{}", t),
+    print!("Fetching metadata... ");
+    let label = fetch_metadata(url);
+    match &label {
+        Some(l) => println!("{}", l),
         None => println!("(not found)"),
     }
 
-    add_entry(url, title, bm_path)
+    add_entry(url, label, bm_path)
 }
 
 fn add_entry(url: &str, title: Option<String>, bm_path: &PathBuf) -> Result<String, BmError> {
@@ -403,6 +490,151 @@ mod tests {
             extract_title_from_html(html),
             Some("With Attrs".into())
         );
+    }
+
+    // -- extract_description_from_html --
+
+    #[test]
+    fn test_extract_description_meta() {
+        let html = r#"<html><head><meta name="description" content="A great site about Rust"></head></html>"#;
+        assert_eq!(
+            extract_description_from_html(html),
+            Some("A great site about Rust".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_description_og() {
+        let html = r#"<meta property="og:description" content="OG description here">"#;
+        assert_eq!(
+            extract_description_from_html(html),
+            Some("OG description here".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_description_og_preferred_over_meta() {
+        let html = r#"<meta property="og:description" content="OG wins"><meta name="description" content="Meta loses">"#;
+        assert_eq!(
+            extract_description_from_html(html),
+            Some("OG wins".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_description_content_before_name() {
+        let html = r#"<meta content="Reversed order" name="description">"#;
+        assert_eq!(
+            extract_description_from_html(html),
+            Some("Reversed order".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_description_content_before_og() {
+        let html = r#"<meta content="Reversed OG" property="og:description">"#;
+        assert_eq!(
+            extract_description_from_html(html),
+            Some("Reversed OG".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_description_empty() {
+        let html = r#"<meta name="description" content="">"#;
+        assert_eq!(extract_description_from_html(html), None);
+    }
+
+    #[test]
+    fn test_extract_description_missing() {
+        let html = "<html><head><title>No desc</title></head></html>";
+        assert_eq!(extract_description_from_html(html), None);
+    }
+
+    #[test]
+    fn test_extract_description_with_entities() {
+        let html = r#"<meta name="description" content="Foo &amp; Bar &ndash; Baz">"#;
+        assert_eq!(
+            extract_description_from_html(html),
+            Some("Foo & Bar \u{2013} Baz".into())
+        );
+    }
+
+    // -- format_bookmark_label --
+
+    #[test]
+    fn test_format_label_title_and_description() {
+        let result = format_bookmark_label(Some("Expo".into()), Some("Build cross-platform apps".into()));
+        assert_eq!(result, Some("Expo: Build cross-platform apps".into()));
+    }
+
+    #[test]
+    fn test_format_label_title_only() {
+        let result = format_bookmark_label(Some("Expo".into()), None);
+        assert_eq!(result, Some("Expo".into()));
+    }
+
+    #[test]
+    fn test_format_label_description_only() {
+        let result = format_bookmark_label(None, Some("A great site".into()));
+        assert_eq!(result, Some("A great site".into()));
+    }
+
+    #[test]
+    fn test_format_label_neither() {
+        let result = format_bookmark_label(None, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_format_label_description_has_title_prefix_separator() {
+        let result = format_bookmark_label(
+            Some("GitHub".into()),
+            Some("GitHub: Where people build software".into()),
+        );
+        assert_eq!(result, Some("GitHub: Where people build software".into()));
+    }
+
+    #[test]
+    fn test_format_label_description_starts_with_title_is() {
+        let result = format_bookmark_label(
+            Some("Expo".into()),
+            Some("Expo is an open-source platform".into()),
+        );
+        assert_eq!(result, Some("Expo: An open-source platform".into()));
+    }
+
+    #[test]
+    fn test_format_label_no_special_prefix() {
+        let result = format_bookmark_label(
+            Some("MyApp".into()),
+            Some("Build amazing things".into()),
+        );
+        assert_eq!(result, Some("MyApp: Build amazing things".into()));
+    }
+
+    #[test]
+    fn test_format_label_identical() {
+        let result = format_bookmark_label(Some("Same".into()), Some("Same".into()));
+        assert_eq!(result, Some("Same".into()));
+    }
+
+    // -- extract_metadata_from_html --
+
+    #[test]
+    fn test_extract_metadata_full() {
+        let html = r#"<html><head><title>My Site</title><meta name="description" content="Best site ever"></head></html>"#;
+        let meta = extract_metadata_from_html(html);
+        assert_eq!(meta.title, Some("My Site".into()));
+        assert_eq!(meta.description, Some("Best site ever".into()));
+    }
+
+    #[test]
+    fn test_extract_metadata_title_only() {
+        let html = "<html><head><title>Just Title</title></head></html>";
+        let meta = extract_metadata_from_html(html);
+        assert_eq!(meta.title, Some("Just Title".into()));
+        assert_eq!(meta.description, None);
     }
 
     // -- decode_html_entities --
