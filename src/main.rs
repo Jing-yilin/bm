@@ -267,6 +267,22 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&mdash;", "\u{2014}")
 }
 
+// --- URL normalization ---
+
+fn normalize_url(input: &str) -> String {
+    let trimmed = input.trim();
+    match url::Url::parse(trimmed) {
+        Ok(u) => u.to_string(),
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            let with_scheme = format!("https://{}", trimmed);
+            url::Url::parse(&with_scheme)
+                .map(|u| u.to_string())
+                .unwrap_or(trimmed.to_string())
+        }
+        Err(_) => trimmed.to_string(),
+    }
+}
+
 // --- URL classification helpers ---
 
 fn is_private_url(url: &str) -> bool {
@@ -460,13 +476,14 @@ fn today() -> String {
 }
 
 fn cmd_add(url: &str, bm_path: &PathBuf) -> Result<String, BmError> {
+    let url = normalize_url(url);
     let mut bookmarks = read_bookmarks(bm_path);
-    if is_duplicate(url, &bookmarks) {
+    if is_duplicate(&url, &bookmarks) {
         return Ok(format!("Already bookmarked: {}", url));
     }
 
     print!("Fetching metadata... ");
-    let meta = fetch_metadata(url);
+    let meta = fetch_metadata(&url);
     let title = meta.title.unwrap_or_default();
     let description = meta.description.unwrap_or_default();
 
@@ -479,7 +496,7 @@ fn cmd_add(url: &str, bm_path: &PathBuf) -> Result<String, BmError> {
 
     let bm = Bookmark {
         date: today(),
-        url: url.to_string(),
+        url: url.clone(),
         title,
         description,
     };
@@ -491,6 +508,7 @@ fn cmd_add(url: &str, bm_path: &PathBuf) -> Result<String, BmError> {
 }
 
 pub fn add_entry(url: &str, title: Option<String>, description: Option<String>, bm_path: &PathBuf) -> Result<String, BmError> {
+    let url = normalize_url(url);
     let mut bookmarks = read_bookmarks(bm_path);
     let bm = Bookmark {
         date: today(),
@@ -750,7 +768,7 @@ mod tests {
         assert!(result.contains("Bookmarked:"));
         let bookmarks = read_bookmarks(&path);
         assert_eq!(bookmarks.len(), 4);
-        assert_eq!(bookmarks[3].url, "https://new.com");
+        assert_eq!(bookmarks[3].url, "https://new.com/");
         assert_eq!(bookmarks[3].title, "New Site");
         assert_eq!(bookmarks[3].description, "A new site");
         assert!(!bookmarks[3].date.is_empty());
@@ -762,7 +780,7 @@ mod tests {
         add_entry("https://notitle.com", None, None, &path).unwrap();
         let bookmarks = read_bookmarks(&path);
         assert_eq!(bookmarks.len(), 4);
-        assert_eq!(bookmarks[3].url, "https://notitle.com");
+        assert_eq!(bookmarks[3].url, "https://notitle.com/");
         assert_eq!(bookmarks[3].title, "");
     }
 
@@ -899,10 +917,10 @@ mod tests {
         add_entry("https://temp.com", Some("Temp".into()), None, &path).unwrap();
         assert_eq!(read_bookmarks(&path).len(), original_count + 1);
 
-        cmd_remove("https://temp.com", &path).unwrap();
+        cmd_remove("https://temp.com/", &path).unwrap();
         let after = read_bookmarks(&path);
         assert_eq!(after.len(), original_count);
-        assert!(!after.iter().any(|b| b.url == "https://temp.com"));
+        assert!(!after.iter().any(|b| b.url == "https://temp.com/"));
     }
 
     // -- migration --
@@ -1036,6 +1054,39 @@ mod tests {
         let p = resolve_path("~/test.csv");
         assert!(p.to_string_lossy().contains("test.csv"));
         assert!(!p.to_string_lossy().starts_with("~"));
+    }
+
+    // -- normalize_url --
+
+    #[test]
+    fn test_normalize_url_no_scheme() {
+        assert_eq!(normalize_url("photomosh.com"), "https://photomosh.com/");
+    }
+
+    #[test]
+    fn test_normalize_url_https() {
+        assert_eq!(normalize_url("https://example.com"), "https://example.com/");
+    }
+
+    #[test]
+    fn test_normalize_url_http() {
+        assert_eq!(normalize_url("http://example.com"), "http://example.com/");
+    }
+
+    #[test]
+    fn test_normalize_url_with_path() {
+        assert_eq!(normalize_url("example.com/path"), "https://example.com/path");
+    }
+
+    #[test]
+    fn test_normalize_url_trims_whitespace() {
+        assert_eq!(normalize_url("  example.com  "), "https://example.com/");
+    }
+
+    #[test]
+    fn test_normalize_url_invalid_input() {
+        // Invalid URL that can't be fixed — returned as-is
+        assert_eq!(normalize_url("://broken"), "://broken");
     }
 
     // -- HTML extraction (kept from before) --
